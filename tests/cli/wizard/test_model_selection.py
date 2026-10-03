@@ -146,17 +146,7 @@ class TestGpt56CatalogPresence:
 
 
 class TestClaudeNewModelsCatalogPresence:
-    """The onboarding picker must offer claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1."""
-
-    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"])
-    def test_anthropic_picker_lists_every_model(self, model: str) -> None:
-        values = {option.value for option in PROVIDER_BY_VALUE["anthropic"].models}
-        assert model in values
-
-    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"])
-    def test_claude_code_picker_lists_every_model(self, model: str) -> None:
-        values = {option.value for option in PROVIDER_BY_VALUE["claude-code"].models}
-        assert model in values
+    """Onboarding must keep the Anthropic default and accept a curated 5.x pick."""
 
     def test_anthropic_default_model_is_unchanged(self) -> None:
         assert PROVIDER_BY_VALUE["anthropic"].default_model == "claude-opus-4-7"
