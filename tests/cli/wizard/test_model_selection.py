@@ -143,3 +143,26 @@ class TestGpt56CatalogPresence:
         _wire_prompts(monkeypatch, select_values=["gpt-5.6-sol"])
 
         assert components.choose_model(provider, default="") == "gpt-5.6-sol"
+
+
+class TestClaudeNewModelsCatalogPresence:
+    """The onboarding picker must offer claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1."""
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"])
+    def test_anthropic_picker_lists_every_model(self, model: str) -> None:
+        values = {option.value for option in PROVIDER_BY_VALUE["anthropic"].models}
+        assert model in values
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"])
+    def test_claude_code_picker_lists_every_model(self, model: str) -> None:
+        values = {option.value for option in PROVIDER_BY_VALUE["claude-code"].models}
+        assert model in values
+
+    def test_anthropic_default_model_is_unchanged(self) -> None:
+        assert PROVIDER_BY_VALUE["anthropic"].default_model == "claude-opus-4-7"
+
+    def test_anthropic_picker_selects_sonnet_5_5(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        provider = PROVIDER_BY_VALUE["anthropic"]
+        _wire_prompts(monkeypatch, select_values=["claude-sonnet-5-5"])
+
+        assert components.choose_model(provider, default="") == "claude-sonnet-5-5"

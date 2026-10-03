@@ -306,6 +306,14 @@ class TestKnownModelCoverage:
         for model in ("gpt-5", "gpt-5-codex", "gpt-4o"):
             assert usd_per_token_blended(model) is not None
 
+    @pytest.mark.parametrize(
+        "model_id",
+        ("claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"),
+    )
+    def test_new_claude_models_have_prices(self, model_id: str) -> None:
+        # New Claude 5.x releases must have prices so the dashboard does not render ``-``.
+        assert usd_per_token_blended(model_id) is not None
+
 
 class TestConfiguredProviderCompatibility:
     """Coverage sweep across every provider in config/llm_auth/provider_catalog.py.
