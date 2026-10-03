@@ -113,6 +113,21 @@ def test_message_update_before_tool_calls_renders_live() -> None:
     assert "Running GitHub CLI checks" in output
 
 
+def test_outcome_report_beside_a_tool_call_is_not_a_working_note() -> None:
+    """The composer shows that report once; the working gutter must not preview it."""
+    observer, buffer = _observer_with_buffer()
+
+    observer(
+        "message_update",
+        {
+            "content": "Repair Report\n\n- **Outcome:** Scheduled repair succeeded.",
+            "has_tool_calls": True,
+        },
+    )
+
+    assert buffer.getvalue() == ""
+
+
 def test_message_update_final_answer_is_not_rendered() -> None:
     """The closing no-tool-call answer is streamed by the turn driver, not here."""
     observer, buffer = _observer_with_buffer()
@@ -443,6 +458,19 @@ def test_skill_view_failure_renders_failure_child() -> None:
     assert buffer.getvalue() == "\nError    Could not load skill · no-such-skill\n"
 
 
+def test_skill_view_of_already_loaded_tool_guidance_prints_nothing() -> None:
+    # Arrange
+    observer, buffer = _skill_observer()
+    call = {"id": "t1", "name": "skill_view", "input": {"name": "tracking-github-work-status"}}
+
+    # Act
+    observer("tool_start", call)
+    observer("tool_end", {**call, "output": {"ok": True, "already_loaded": True}})
+
+    # Assert: no "Skill activated" line and no error row.
+    assert buffer.getvalue() == ""
+
+
 def test_skill_view_tool_end_without_start_prints_nothing() -> None:
     observer, buffer = _skill_observer()
 
@@ -733,7 +761,6 @@ def test_chat_turn_records_single_cli_agent_history_entry() -> None:
         "what broke in prod?",
         session,
         console,
-        recorder=None,
         execute_actions=_no_actions,
     )
 
@@ -929,3 +956,145 @@ def test_command_tools_suppress_the_static_action_header() -> None:
         assert "Execute" not in out
         assert "opensre" not in out
         assert cmd not in out  # header suppressed; the $cmd line comes from the presenter
+
+
+def test_a_tools_progress_update_is_drawn_as_a_dim_line() -> None:
+    # Arrange
+    observer, buffer = _observer_with_buffer()
+
+    # Act
+    observer("tool_update", {"name": "ask_hosted_gateway", "update": {"progress": "Reading runs…"}})
+    observer("tool_update", {"name": "other", "update": {"partial": 3}})
+
+    # Assert: only a progress text is drawn, once
+    output = buffer.getvalue()
+    assert "↳ Reading runs…" in output and output.count("↳") == 1
+
+
+def test_a_gateway_tool_replaces_the_spinner_and_skips_the_transcript_on_a_tty() -> None:
+    """Remote work shows on the spinner, marked as the gateway, not as a description dump."""
+    from surfaces.interactive_shell.runtime.core.state import SpinnerState
+    from surfaces.interactive_shell.ui.task_plan import GATEWAY_ACTIVITY_MARKER
+    from surfaces.shared.terminal.output.console_state import set_turn_spinner
+
+    buffer = io.StringIO()
+    console = Console(file=buffer, force_terminal=True, highlight=False, width=120)
+    observer = ActionRenderObserver(session=Session(), console=console, message="probe")
+    spinner = SpinnerState()
+    spinner.start()
+    set_turn_spinner(spinner)
+    try:
+        observer(
+            "tool_start",
+            {"id": "gw", "name": "ask_hosted_gateway", "input": {"prompt": "probe github"}},
+        )
+        observer(
+            "tool_update",
+            {
+                "id": "gw",
+                "name": "ask_hosted_gateway",
+                "update": {
+                    "kind": "tool",
+                    "progress": "GitHub CLI · gh api user --include",
+                },
+            },
+        )
+        output = buffer.getvalue()
+        assert "Run GitHub CLI" not in output
+        assert "↳" not in output
+        assert (
+            spinner.active_action
+            == f"{GATEWAY_ACTIVITY_MARKER} · GitHub CLI · gh api user --include"
+        )
+    finally:
+        set_turn_spinner(None)
+
+
+def test_a_gateway_plan_replaces_in_place_and_a_settled_plan_prints_once() -> None:
+    from surfaces.interactive_shell.runtime.core.state import ReplState
+    from surfaces.interactive_shell.ui.task_plan import GATEWAY_ACTIVITY_MARKER
+    from surfaces.shared.terminal.output.console_state import set_repl_state
+
+    state = ReplState()
+    set_repl_state(state)
+    observer, buffer = _observer_with_buffer()
+    first = "Plan · 1/2\n  ● List organization memberships\n  ○ Check permission"
+    second = "Plan · 2/2\n  ✓ List organization memberships\n  ● Check permission"
+    try:
+        observer(
+            "tool_update",
+            {"name": "ask_hosted_gateway", "update": {"kind": "plan", "progress": first}},
+        )
+        observer(
+            "tool_update",
+            {"name": "ask_hosted_gateway", "update": {"kind": "plan", "progress": second}},
+        )
+        assert "List organization" not in buffer.getvalue()
+        assert state.gateway_plan is not None
+        assert state.gateway_plan.steps[0].status.value == "completed"
+        observer(
+            "tool_update",
+            {
+                "name": "ask_hosted_gateway",
+                "update": {
+                    "kind": "plan_done",
+                    "progress": "Plan complete · 2/2\n  ✓ List organization memberships\n  ✓ Check permission",
+                },
+            },
+        )
+        output = buffer.getvalue()
+        assert state.gateway_plan is None
+        assert GATEWAY_ACTIVITY_MARKER in output
+        assert "Plan complete · 2/2" in output
+        assert "✓" in output
+        assert "Check permission" in output
+        assert output.count("Plan complete") == 1
+    finally:
+        set_repl_state(None)
+
+
+def test_a_truncated_gateway_plan_is_shown_and_not_pinned() -> None:
+    from config.constants.gateway import PROMPT_PROGRESS_PLAN_OMITTED
+    from surfaces.interactive_shell.runtime.core.state import ReplState
+    from surfaces.shared.terminal.output.console_state import set_repl_state
+
+    state = ReplState()
+    set_repl_state(state)
+    observer, buffer = _observer_with_buffer()
+    progress = f"Plan · 1/2\n  ● List orgs\n{PROMPT_PROGRESS_PLAN_OMITTED}"
+    try:
+        observer(
+            "tool_update",
+            {
+                "name": "ask_hosted_gateway",
+                "update": {
+                    "kind": "plan",
+                    "progress": "Plan · 1/2\n  ● List organization memberships\n  ○ Check permission",
+                },
+            },
+        )
+        assert state.gateway_plan is not None
+        observer(
+            "tool_update",
+            {"name": "ask_hosted_gateway", "update": {"kind": "plan", "progress": progress}},
+        )
+        assert state.gateway_plan is None
+        assert PROMPT_PROGRESS_PLAN_OMITTED in buffer.getvalue()
+    finally:
+        set_repl_state(None)
+
+
+def test_a_gateway_note_keeps_every_row() -> None:
+    """A wait notice is still a dim line, and a long row is not cut."""
+    observer, buffer = _observer_with_buffer()
+    command = "rg -n -C 3 'GET /repos/davincios/opensre-onboarding-ci-repair-demo'"
+
+    observer(
+        "tool_update",
+        {"name": "ask_hosted_gateway", "update": {"progress": f"waiting\n({command})"}},
+    )
+
+    output = buffer.getvalue()
+    assert command in output
+    assert "opensre-onbo…" not in output
+    assert output.count("↳") == 1

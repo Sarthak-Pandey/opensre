@@ -1535,17 +1535,70 @@ def test_key_results_omit_the_attribution_when_one_workflow_explains_it() -> Non
 
 
 def test_tool_names_the_setup_command_when_no_token_is_available() -> None:
-    with patch("integrations.github.tools.ci_analytics.tool.resolve_github_token", return_value=""):
+    """The model's instructions stay in ``error``; the user reads only what to run.
+
+    A turn that ends on the queued setup wizard closes with ``response_text``,
+    which used to tell the user to call ``slash_invoke`` and end the turn.
+    """
+    with patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value=""):
         result = analyze_github_ci_reliability(owner="o", repo="r")
 
     assert result["available"] is False
-    assert "opensre integrations setup github" in result["response_text"]
+    assert result["setup_command"] == "/integrations setup github"
+    assert 'slash_invoke(command="/integrations", args=["setup", "github"])' in result["error"]
+    assert "call analyze_github_ci_reliability again for o/r" in result["error"]
+    assert "leave the analysis blocked" in result["error"]
+    assert result["response_text"] == (
+        "GitHub isn't connected yet, so the Actions history of o/r can't be read. "
+        "Set it up with `opensre integrations setup github`."
+    )
+
+
+def test_same_repository_analyzes_after_github_is_connected() -> None:
+    """A first run with no token returns setup; the next call for that repo succeeds."""
+    collected = CollectedRuns(
+        default_branch="main",
+        branch_runs=[],
+        pr_runs=[],
+        merged_prs=(),
+        coverage_notices=[],
+    )
+    with patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value=""):
+        blocked = analyze_github_ci_reliability(owner="acme", repo="widget", days=30)
+    assert blocked["available"] is False
+    assert "opensre integrations setup github" in blocked["response_text"]
+    assert "acme/widget" in blocked["response_text"]
+
+    with (
+        patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value="t"),
+        patch(
+            "integrations.github.tools.ci_analytics.analysis.collect_runs",
+            return_value=collected,
+        ),
+    ):
+        resumed = analyze_github_ci_reliability(owner="acme", repo="widget", days=30)
+
+    assert resumed["success"] is True
+    assert resumed["owner"] == "acme"
+    assert resumed["repo"] == "widget"
+    assert resumed["key_results"] is not None
+
+
+def test_tool_stays_listed_on_a_fresh_install_with_no_github_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_MCP_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+    tool = analyze_github_ci_reliability.__opensre_registered_tool__
+
+    assert tool.is_available({}) is True
 
 
 def test_tool_failure_text_never_carries_exception_detail() -> None:
     secret_detail = "token ghp_abc rejected by https://api.github.com/x"
     with (
-        patch("integrations.github.tools.ci_analytics.tool.resolve_github_token", return_value="t"),
+        patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value="t"),
         patch(
             "integrations.github.tools.ci_analytics.analysis.collect_runs",
             side_effect=GitHubApiError(secret_detail, status_code=403),
@@ -1571,7 +1624,7 @@ def test_tool_renders_report_from_collected_runs() -> None:
         coverage_notices=["Coverage notice: sample"],
     )
     with (
-        patch("integrations.github.tools.ci_analytics.tool.resolve_github_token", return_value="t"),
+        patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value="t"),
         patch(
             "integrations.github.tools.ci_analytics.analysis.collect_runs", return_value=collected
         ),
@@ -1613,7 +1666,7 @@ def test_tool_prints_progress_lines_but_never_the_report() -> None:
     )
 
     with (
-        patch("integrations.github.tools.ci_analytics.tool.resolve_github_token", return_value="t"),
+        patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value="t"),
         patch(
             "integrations.github.tools.ci_analytics.analysis.collect_runs", return_value=collected
         ),
@@ -1656,7 +1709,7 @@ def test_tool_returns_figures_and_no_rendered_report() -> None:
     )
 
     with (
-        patch("integrations.github.tools.ci_analytics.tool.resolve_github_token", return_value="t"),
+        patch("integrations.github.tools.ci_analytics.tool.github_rest_token", return_value="t"),
         patch(
             "integrations.github.tools.ci_analytics.analysis.collect_runs", return_value=collected
         ),

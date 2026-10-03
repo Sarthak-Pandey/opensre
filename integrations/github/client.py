@@ -33,6 +33,7 @@ class GitHubApiError(RuntimeError):
     message: str
     status_code: int | None = None
     path: str = ""
+    method: str = ""
     rate_limit_remaining: str | None = None
     rate_limit_reset: str | None = None
 
@@ -62,6 +63,15 @@ def _next_link(headers: Any) -> str | None:
         if 'rel="next"' in rel_part or "rel=next" in rel_part:
             return url_part.strip().strip("<>")
     return None
+
+
+def _response_headers(response: Any) -> dict[str, str]:
+    """Copy response headers. ``X-OAuth-Scopes`` is only present here, not in the body."""
+    raw = getattr(response, "headers", None)
+    items = getattr(raw, "items", None)
+    if not callable(items):
+        return {}
+    return {str(key): str(value) for key, value in items()}
 
 
 def _decode_json_payload(raw: str, *, path: str) -> JsonPayload:
@@ -100,6 +110,27 @@ class GitHubRestClient:
         accept: str = "application/vnd.github+json",
         api_version: str = "2022-11-28",
     ) -> JsonPayload:
+        payload, _headers = self.request_with_headers(
+            method,
+            path,
+            params=params,
+            body=body,
+            accept=accept,
+            api_version=api_version,
+        )
+        return payload
+
+    def request_with_headers(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+        accept: str = "application/vnd.github+json",
+        api_version: str = "2022-11-28",
+    ) -> tuple[JsonPayload, dict[str, str]]:
+        """One REST call, returning the JSON body and the response headers."""
         if not self._token and not (self._allow_unauthenticated_read and method.upper() == "GET"):
             raise GitHubApiError(
                 "GitHub token is required. Configure github_token, GITHUB_TOKEN, or GH_TOKEN."
@@ -121,6 +152,7 @@ class GitHubRestClient:
         try:
             with request.urlopen(req, timeout=20) as response:  # nosemgrep
                 raw = response.read().decode("utf-8")
+                headers = _response_headers(response)
         except error.HTTPError as exc:
             detail = ""
             if exc.fp is not None:
@@ -130,15 +162,20 @@ class GitHubRestClient:
                 message,
                 status_code=exc.code,
                 path=path,
+                method=method.upper(),
                 rate_limit_remaining=exc.headers.get("X-RateLimit-Remaining")
                 if exc.headers
                 else None,
                 rate_limit_reset=exc.headers.get("X-RateLimit-Reset") if exc.headers else None,
             ) from exc
         except error.URLError as exc:
-            raise GitHubApiError(f"GitHub API request failed: {exc.reason}", path=path) from exc
+            raise GitHubApiError(
+                f"GitHub API request failed: {exc.reason}",
+                path=path,
+                method=method.upper(),
+            ) from exc
 
-        return _decode_json_payload(raw, path=path)
+        return _decode_json_payload(raw, path=path), headers
 
     def paginate(
         self,
@@ -188,13 +225,18 @@ class GitHubRestClient:
                     detail or exc.msg or "GitHub API request failed.",
                     status_code=exc.code,
                     path=path,
+                    method="GET",
                     rate_limit_remaining=exc.headers.get("X-RateLimit-Remaining")
                     if exc.headers
                     else None,
                     rate_limit_reset=exc.headers.get("X-RateLimit-Reset") if exc.headers else None,
                 ) from exc
             except error.URLError as exc:
-                raise GitHubApiError(f"GitHub API request failed: {exc.reason}", path=path) from exc
+                raise GitHubApiError(
+                    f"GitHub API request failed: {exc.reason}",
+                    path=path,
+                    method="GET",
+                ) from exc
 
             parsed = _decode_json_payload(raw, path=path) if raw.strip() else []
             if isinstance(parsed, list):

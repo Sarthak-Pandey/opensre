@@ -35,6 +35,7 @@ from core.agent_harness.session.persistence.jsonl_store import JsonlSessionStore
 from core.agent_harness.session_goal.goal import SessionGoal
 from core.agent_harness.task_plan.plan import TaskPlan
 from core.state import MutableAgentState
+from infrastructure.harness_providers import integration_sources_stamp
 from infrastructure.scheduling.task_registry import TaskRegistry
 
 #: How many recent history rows keep their full response body. Sized above
@@ -168,9 +169,8 @@ class SessionCore:
 
     A question the user has settled must not be asked again later in the
     session, whether it comes back through a skill's entry hook or because the
-    model calls the menu tool itself. Session-scoped on purpose: ``/new`` starts
-    clean, and a ``/resume`` may ask again, since the answer's effect is not
-    restored either.
+    model calls the menu tool itself. ``/new`` starts clean; resume restores the
+    keys so a multi-round workflow does not repeat an earlier blocker.
     """
 
     skill_question_keys: dict[str, set[str]] = field(default_factory=dict)
@@ -332,6 +332,10 @@ class SessionCore:
     @resolved_integrations_cache.setter
     def resolved_integrations_cache(self, value: dict[str, Any] | None) -> None:
         self.integrations.resolved_cache = value
+        # Every writer stamps the sources the cache came from, so a rewritten
+        # store or a changed remote set invalidates it on the next turn no
+        # matter who filled it.
+        self.integrations.store_stamp = integration_sources_stamp() if value else None
 
     @property
     def vcs_repo_scopes(self) -> dict[str, tuple[str, ...]]:

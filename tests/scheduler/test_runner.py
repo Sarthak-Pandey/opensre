@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from config.constants.turn_concurrency import OPENSRE_SCHEDULER_MAX_CONCURRENT_RUNS_ENV
+from infrastructure.scheduling.scheduler import runner as scheduler_runner
 from infrastructure.scheduling.scheduler.loop_constants import LOOP_PROMPT_PARAM
 from infrastructure.scheduling.scheduler.outcomes import WorkOutcome, WorkStatus
 from infrastructure.scheduling.scheduler.runner import (
@@ -32,6 +33,17 @@ from infrastructure.scheduling.scheduler.types import (
     TaskStatus,
 )
 from tests.scheduler._bundle import real_runners
+
+
+@pytest.fixture(autouse=True)
+def _schedule_cancel_follows_runner_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep in-flight cancel checks on the same ``get_task`` the runner tests stub."""
+    import infrastructure.scheduling.scheduler.schedule_cancel as schedule_cancel
+
+    def _get_task_from_runner(task_id: str) -> ScheduledTask | None:
+        return scheduler_runner.get_task(task_id)
+
+    monkeypatch.setattr(schedule_cancel, "get_task", _get_task_from_runner)
 
 
 class TestMakeTrigger:
@@ -550,6 +562,91 @@ class TestRegisterJobs:
 
         assert count == 1
         assert scheduler.job_ids == ["prompt-loop"]
+
+    def test_never_run_ci_repair_registers_an_immediate_fire(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        from config.constants.ci_repair import CI_REPAIR_CRON, CI_REPAIR_REPORT_BUILDER
+        from infrastructure.scheduling.scheduler.loop_constants import (
+            LOOP_REPORT_ARGS_PARAM,
+            LOOP_REPORT_PARAM,
+        )
+        from infrastructure.scheduling.scheduler.storage import task_store as scheduler_store
+        from infrastructure.scheduling.scheduler.storage.task_store import add_task, get_task
+
+        now = datetime(2026, 10, 3, 15, 9, 7, tzinfo=UTC)
+        due = now - timedelta(seconds=5)
+        later = now + timedelta(hours=2)
+
+        class _FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> datetime:
+                _ = tz
+                return now
+
+        class _RecordingScheduler:
+            def __init__(self) -> None:
+                self.jobs: dict[str, dict[str, object]] = {}
+
+            def add_job(self, *args: object, **kwargs: object) -> None:
+                _ = args
+                self.jobs[str(kwargs["id"])] = kwargs
+
+        def repair(task_id: str, *, next_run: str, last_run: str | None) -> ScheduledTask:
+            return ScheduledTask(
+                id=task_id,
+                kind=TaskKind.MANUAL_LOOP,
+                cron=CI_REPAIR_CRON,
+                timezone="UTC",
+                provider=Provider.INTERACTIVE_SHELL,
+                last_run=last_run,
+                next_run=next_run,
+                params={
+                    LOOP_REPORT_PARAM: CI_REPAIR_REPORT_BUILDER,
+                    LOOP_REPORT_ARGS_PARAM: json.dumps({"run_id": task_id}),
+                },
+            )
+
+        monkeypatch.setattr(scheduler_runner, "datetime", _FrozenDateTime)
+        store_path = tmp_path / "tasks.json"
+        monkeypatch.setattr(scheduler_store, "default_task_store_path", lambda: store_path)
+        add_task(repair("repair-due", next_run=due.isoformat(), last_run=None), store_path)
+        add_task(repair("repair-later", next_run=later.isoformat(), last_run=None), store_path)
+        add_task(
+            repair("repair-ran", next_run=due.isoformat(), last_run=now.isoformat()), store_path
+        )
+        add_task(
+            ScheduledTask(
+                id="digest",
+                kind=TaskKind.SENTRY_MORNING_DIGEST,
+                cron="0 9 * * *",
+                timezone="UTC",
+                provider=Provider.TELEGRAM,
+                next_run=due.isoformat(),
+            ),
+            store_path,
+        )
+
+        scheduler = _RecordingScheduler()
+        assert _register_jobs(scheduler, real_runners()) == 4
+
+        due_job = scheduler.jobs["repair-due"]
+        assert due_job["next_run_time"] == due
+        assert due_job["misfire_grace_time"] is None
+        assert get_task("repair-due") is not None
+        assert get_task("repair-due").next_run == due.isoformat()
+
+        for task_id in ("repair-later", "repair-ran", "digest"):
+            assert "next_run_time" not in scheduler.jobs[task_id]
+            stored = get_task(task_id)
+            assert stored is not None
+            assert stored.next_run == compute_next_run(stored, now)
+            assert stored.next_run != due.isoformat()
 
     def test_resync_removes_stale_jobs(
         self,

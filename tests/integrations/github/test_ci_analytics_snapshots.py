@@ -84,6 +84,55 @@ def _report(*, owner: str = "apache", repo: str = "airflow", red_hours: float = 
     )
 
 
+def test_report_payload_preserves_fields_and_rounding() -> None:
+    from integrations.github.tools.ci_analytics.payload import report_payload
+
+    report = dataclasses.replace(
+        _report(),
+        blocked_minutes=120.26,
+        blocked_minutes_all=150.26,
+        blocked_working_minutes=61.26,
+        red_hours=24.567,
+    )
+
+    payload = report_payload(report)
+
+    assert payload == {
+        "executions": 100,
+        "pr_executions": 80,
+        "pr_failures": 8,
+        "pr_failure_rate": 0.1,
+        "reliability_failures": 0,
+        "source_failures": 0,
+        "unresolved_failures": 0,
+        "blocked_minutes": 120.3,
+        "blocked_minutes_all": 150.3,
+        "merged_pr_branches": 10,
+        "blocked_working_minutes": 61.3,
+        "blocked_working_hours": 1.0,
+        "working_hours": "Mon-Fri 09:00-18:00 UTC",
+        "developers_affected": 0,
+        "developers": [],
+        "blocked_prs": [],
+        "branch_runs": 20,
+        "branch_failures": 2,
+        "red_hours": 24.57,
+        "outages": 1,
+        "mean_recovery_hours": 6.1,
+        "workflows": [
+            {
+                "workflow": "CI",
+                "runs": 100,
+                "failures": 8,
+                "reliability_failures": 3,
+                "normal_minutes": 12.0,
+                "red_hours": 0.0,
+            }
+        ],
+        "coverage_notices": ["partial"],
+    }
+
+
 def _write_report_snapshot(root: Path, report: Any, now: datetime) -> None:
     from integrations.github.tools.ci_analytics.snapshots import report_to_dict
 
@@ -110,7 +159,7 @@ def test_the_comparison_needs_no_saved_peer_figures(tmp_path: Path, monkeypatch)
     from integrations.github.tools.ci_analytics.benchmarks import BENCHMARKS, MEASURED_ON
 
     monkeypatch.setattr(tool_module, "snapshot_root", lambda _root=None: tmp_path)
-    monkeypatch.setattr(tool_module, "resolve_github_token", lambda _t=None: "tok")
+    monkeypatch.setattr(tool_module, "github_rest_token", lambda **_kw: "tok")
 
     def _analyze(_owner: str, _repo: str, **_kwargs: Any) -> Any:
         return type("A", (), {"report": _report(owner="acme", repo="app"), "runs_read": 3})()
@@ -214,7 +263,7 @@ def test_a_saved_snapshot_never_answers_a_live_analysis(tmp_path: Path, monkeypa
     now = datetime.now(UTC)
     _write_report_snapshot(tmp_path, _report(), now)
     monkeypatch.setattr(tool_module, "snapshot_root", lambda _root=None: tmp_path)
-    monkeypatch.setattr(tool_module, "resolve_github_token", lambda _t=None: "tok")
+    monkeypatch.setattr(tool_module, "github_rest_token", lambda **_kw: "tok")
     reads: list[str] = []
 
     def _analyze(owner: str, repo: str, **_kwargs: Any) -> Any:
@@ -282,7 +331,7 @@ def test_a_snapshot_write_failure_does_not_discard_the_analysis(
     from integrations.github.tools.ci_analytics import tool as tool_module
 
     monkeypatch.setattr(tool_module, "snapshot_root", lambda _root=None: tmp_path)
-    monkeypatch.setattr(tool_module, "resolve_github_token", lambda _t=None: "tok")
+    monkeypatch.setattr(tool_module, "github_rest_token", lambda **_kw: "tok")
 
     def _analysis(*_a: Any, **_k: Any) -> Any:
         return type("A", (), {"report": _report(), "runs_read": 1})()

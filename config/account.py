@@ -16,11 +16,16 @@ from filelock import FileLock
 from config.constants.account import (
     OPENSRE_ACCOUNT_FILENAME,
     OPENSRE_ACCOUNT_LLM_BASE_PATH,
+    OPENSRE_ACCOUNT_LLM_MODEL_ENV,
     OPENSRE_ACCOUNT_METADATA_PATH_ENV,
     OPENSRE_ACCOUNT_TOKEN_ENV,
     OPENSRE_APP_URL_DEFAULT,
     OPENSRE_APP_URL_ENV,
+    OPENSRE_GATEWAY_LLM_MODEL_DEFAULT,
 )
+from config.constants.billing import WEBAPP_URL_ENV
+from config.constants.hosted_gateway import HOSTED_GATEWAY_LOOPBACK_HOSTS
+from config.constants.llm import OPENAI_API_KEY_ENV, OPENAI_BASE_URL_ENV
 from config.constants.paths import host_home
 from config.secrets.store import (
     delete_secret,
@@ -30,6 +35,7 @@ from config.secrets.store import (
 )
 
 _VERSION = 1
+_DEFAULT_ACCOUNT_LLM_MODEL = "gpt-5.4-mini"
 _LOCK_TIMEOUT_SECONDS = 10.0
 
 
@@ -44,7 +50,7 @@ class AccountRecord:
     signed_in_at: str
     token_expires_at: str
     llm_provider: str = "openai"
-    llm_model: str = "gpt-5.4-mini"
+    llm_model: str = _DEFAULT_ACCOUNT_LLM_MODEL
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,19 @@ def normalize_account_app_url(value: str | None = None) -> str:
         )
     path = parsed.path.rstrip("/")
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def is_secure_account_origin(app_url: str) -> bool:
+    """Whether the account token may be sent to ``app_url``.
+
+    True for any https origin, and for plain http only to this machine
+    (local development against ``localhost:3000``).
+    """
+    parsed = urlsplit(app_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and host:
+        return True
+    return parsed.scheme == "http" and host in HOSTED_GATEWAY_LOOPBACK_HOSTS
 
 
 def account_metadata_path() -> Path:
@@ -195,14 +214,43 @@ def delete_account_token() -> None:
 
 
 def account_llm_route() -> AccountLLMRoute | None:
-    """Return the hosted OpenAI route only when account metadata and token exist."""
-    record = load_account_record()
-    if record is None or record.llm_provider != "openai" or not resolve_account_token():
+    """Return the hosted OpenAI route when this process holds an OpenSRE token.
+
+    A signed-in laptop has account metadata from ``opensre account login``. A
+    hosted gateway never logs in: the control plane injects its organization's
+    token (``OPENSRE_ACCOUNT_TOKEN``) and the webapp URL, and that pair is the
+    route. The webapp meters the calls against the token's organization.
+    """
+    if not resolve_account_token():
         return None
+    record = load_account_record()
+    if record is not None:
+        if record.llm_provider != "openai":
+            return None
+        app_url, model = record.app_url, record.llm_model
+    else:
+        app_url = os.getenv(WEBAPP_URL_ENV, "").strip()
+        if not app_url:
+            return None
+        model = (
+            os.getenv(OPENSRE_ACCOUNT_LLM_MODEL_ENV, "").strip()
+            or OPENSRE_GATEWAY_LLM_MODEL_DEFAULT
+        )
     return AccountLLMRoute(
-        base_url=f"{record.app_url.rstrip('/')}{OPENSRE_ACCOUNT_LLM_BASE_PATH}",
-        model=record.llm_model,
+        base_url=f"{app_url.rstrip('/')}{OPENSRE_ACCOUNT_LLM_BASE_PATH}",
+        model=model,
     )
+
+
+def hosted_openai_env() -> dict[str, str] | None:
+    """OpenAI-compatible env for a subprocess on the hosted route, or ``None`` if unsigned."""
+    route = account_llm_route()
+    if route is None:
+        return None
+    token = resolve_account_token()
+    if not token:
+        return None
+    return {OPENAI_API_KEY_ENV: token, OPENAI_BASE_URL_ENV: route.base_url}
 
 
 __all__ = [
@@ -212,6 +260,8 @@ __all__ = [
     "account_metadata_path",
     "delete_account_record",
     "delete_account_token",
+    "hosted_openai_env",
+    "is_secure_account_origin",
     "load_account_record",
     "normalize_account_app_url",
     "resolve_account_token",

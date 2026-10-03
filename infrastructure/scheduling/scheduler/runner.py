@@ -16,6 +16,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from config.constants.ci_repair import CI_REPAIR_REPORT_BUILDER
 from config.constants.turn_concurrency import (
     DEFAULT_SCHEDULED_RUN_CONCURRENCY,
     OPENSRE_SCHEDULER_MAX_CONCURRENT_RUNS_ENV,
@@ -23,6 +24,7 @@ from config.constants.turn_concurrency import (
 from config.constants.work_items import WORK_ITEM_REMINDER_RUN_AT_PARAM
 from infrastructure.scheduling.scheduler.cron_expression import build_cron_trigger
 from infrastructure.scheduling.scheduler.executor import execute_task
+from infrastructure.scheduling.scheduler.loop_constants import LOOP_REPORT_PARAM
 from infrastructure.scheduling.scheduler.operation_log import (
     record_scheduler_execution_operation,
     record_scheduler_service_operation,
@@ -205,6 +207,46 @@ def _scheduled_job(
         _record_task_success_after_full_delivery(task.id, fire_time)
 
 
+def _complete_recoverable_as_skipped(
+    run: Any,
+    task: ScheduledTask | None,
+) -> bool:
+    """Drop a queued tick whose schedule was disabled or deleted."""
+    claim = try_claim(run.task_id, run.fire_time)
+    if claim is None:
+        return False
+    reason = "missing_task" if task is None else "disabled"
+    if task is None:
+        record_scheduler_service_operation(
+            "scheduler_job_skipped",
+            extra={"task_id": run.task_id, "fire_time": run.fire_time, "reason": reason},
+        )
+    else:
+        record_scheduler_execution_operation(
+            "scheduled_task_execution_skipped",
+            task,
+            fire_time=run.fire_time,
+            status=TaskStatus.SKIPPED,
+            extra={"reason": reason},
+        )
+    complete_run(claim, status=TaskStatus.SKIPPED, error=reason)
+    return True
+
+
+def _skip_cancelled_recoverable_runs() -> None:
+    """Finish disabled/deleted ticks without occupying the live-recovery scan."""
+    while True:
+        skipped = 0
+        for run in get_recoverable_runs():
+            task = get_task(run.task_id)
+            if task is not None and task.enabled:
+                continue
+            if _complete_recoverable_as_skipped(run, task):
+                skipped += 1
+        if skipped == 0:
+            return
+
+
 def _recover_runs(
     runners: SchedulerRunners,
     *,
@@ -214,11 +256,13 @@ def _recover_runs(
     """Resume pending and expired ticks within the scheduler worker pool."""
     _ = scheduled_run_time
     eligible_task_ids = _desired_task_ids(task_filter=task_filter)
+    # Cancelled ticks must be skip-completed even when they outnumber the
+    # recovery scan limit, or they stay queued and fire after a later re-enable.
+    _skip_cancelled_recoverable_runs()
     for run in get_recoverable_runs(eligible_task_ids=eligible_task_ids):
         task = get_task(run.task_id)
         if task is None or not task.enabled:
-            continue
-        if task_filter is not None and not task_filter(task):
+            _complete_recoverable_as_skipped(run, task)
             continue
         result = execute_task(task, run.fire_time, runners)
         if result:
@@ -255,6 +299,27 @@ def _register_recovery_job(
     )
 
 
+def _immediate_ci_repair_fire(task: ScheduledTask, now: datetime) -> datetime | None:
+    """Due time for a never-run CI repair whose stored next run is already due."""
+    if task.last_run is not None:
+        return None
+    if task.params.get(LOOP_REPORT_PARAM) != CI_REPAIR_REPORT_BUILDER:
+        return None
+    raw = (task.next_run or "").strip()
+    if not raw:
+        return None
+    try:
+        due = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    due = due.astimezone(UTC)
+    if due > now:
+        return None
+    return due
+
+
 def _register_jobs(
     scheduler: Any,
     runners: SchedulerRunners,
@@ -263,6 +328,7 @@ def _register_jobs(
 ) -> int:
     """Register all enabled tasks on *scheduler*; invalid tasks are logged and skipped."""
     enabled_count = 0
+    now = datetime.now(UTC)
     for task in list_tasks():
         if not task.enabled:
             continue
@@ -273,10 +339,19 @@ def _register_jobs(
         except ValueError as exc:
             logger.error("Skipping task %s: %s", task.id, exc)
             continue
-        next_run = _next_run_from_trigger(trigger)
-        if task.next_run != next_run:
-            task.next_run = next_run
-            update_task(task)
+        immediate = _immediate_ci_repair_fire(task, now)
+        job_kwargs: dict[str, Any] = {}
+        next_run: str | None
+        if immediate is not None:
+            # Keep the stored due time. The cron trigger would replace it with the
+            # next */30 slot, and a resync would lose the first immediate fire.
+            next_run = immediate.isoformat()
+            job_kwargs["next_run_time"] = immediate
+        else:
+            next_run = _next_run_from_trigger(trigger)
+            if task.next_run != next_run:
+                task.next_run = next_run
+                update_task(task)
 
         scheduler.add_job(
             _scheduled_job,
@@ -287,6 +362,7 @@ def _register_jobs(
             replace_existing=True,
             misfire_grace_time=None,
             max_instances=1,
+            **job_kwargs,
         )
         enabled_count += 1
         record_scheduler_task_operation(

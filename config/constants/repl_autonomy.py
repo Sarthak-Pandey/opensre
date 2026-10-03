@@ -74,6 +74,9 @@ AUTO_LEVEL_ASK_TOOL_TYPES: Final[dict[AutoLevel, frozenset[str] | None]] = {
     AutoLevel.OFF: None,  # ask every tool type
 }
 
+# No tool asks at every auto level. The shell's approval hook reads this set.
+ASK_AT_EVERY_AUTO_LEVEL_TOOL_NAMES: Final[frozenset[str]] = frozenset()
+
 
 def parse_auto_level(raw: str) -> AutoLevel | None:
     """Parse a user-facing auto level, or ``None`` when unknown."""
@@ -98,6 +101,7 @@ def format_auto_status_bar(level: AutoLevel) -> str:
 
 
 __all__ = [
+    "ASK_AT_EVERY_AUTO_LEVEL_TOOL_NAMES",
     "AUTO_LEVEL_ASK_TOOL_TYPES",
     "AUTO_LEVEL_BAR_CAPTIONS",
     "AUTO_LEVEL_CAPTIONS",

@@ -7,9 +7,15 @@ import enum
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from prompt_toolkit.application.current import get_app_or_none
 
+from core.agent_harness.spi.cancel import (
+    HostCancelEvent,
+    HostCancelReason,
+    turn_cancel_reason,
+)
 from infrastructure.terminal import theme as ui_theme
 from infrastructure.terminal.spinner_frames import BRAILLE_SPINNER_FRAMES, spinner_frames
 from surfaces.shared.terminal.components.token_format import (
@@ -21,6 +27,9 @@ from surfaces.shared.terminal.prompt_layout import (
     prompt_line_width,
     prompt_text_width,
 )
+
+if TYPE_CHECKING:
+    from core.agent_harness.spi.task_plan import TaskPlan
 
 # How often prompt-toolkit refreshes prompt callbacks and confirmation polling.
 PROMPT_REFRESH_INTERVAL_S = 0.25
@@ -108,6 +117,8 @@ class ReplState:
     plan_expanded: bool = False
     # Checklist identity for ``plan_expanded`` — step texts, ignoring status.
     plan_step_texts: tuple[str, ...] | None = None
+    # Hosted-gateway checklist pinned above the local plan. Not ``task_plan``.
+    gateway_plan: TaskPlan | None = None
     phase: TurnPhase = TurnPhase.IDLE
     ctrl_c_exit_hint_until: float = 0.0
 
@@ -123,6 +134,37 @@ class ReplState:
 
     def is_cancelling(self) -> bool:
         return self.phase is TurnPhase.CANCELLING
+
+    def is_goal_pause_requested(self) -> bool:
+        return turn_cancel_reason(self.current_cancel_event) is HostCancelReason.GOAL_PAUSE
+
+    def request_goal_pause(self, *, interrupt: bool = True) -> None:
+        """Mark this dispatch as a goal pause and optionally stop current work.
+
+        The reason lives on the canonical turn-cancel event. When the current
+        action has not attached a goal yet, retain that reason without setting
+        the event so the action may finish and the new goal can be paused at
+        the next safe boundary.
+        """
+        cancel = self.current_cancel_event
+        if cancel is None and self.is_dispatch_running():
+            cancel = self.ensure_current_cancel_event()
+        if isinstance(cancel, HostCancelEvent):
+            cancel.request(HostCancelReason.GOAL_PAUSE, interrupt=interrupt)
+        elif interrupt and cancel is not None:
+            cancel.set()
+        if interrupt and (
+            cancel is not None or self.confirm_event is not None or self.is_dispatch_running()
+        ):
+            self.phase = TurnPhase.CANCELLING
+        if interrupt and self.confirm_event is not None:
+            self.confirm_event.set()
+
+    def ensure_current_cancel_event(self) -> threading.Event:
+        """Return the canonical event for the current or about-to-start dispatch."""
+        if self.current_cancel_event is None:
+            self.current_cancel_event = HostCancelEvent()
+        return self.current_cancel_event
 
     def deliver_confirmation(self, answer: str) -> None:
         if self.confirm_event is None:
@@ -185,6 +227,7 @@ class ReplState:
     def attach_turn_task(self, task: asyncio.Task[None]) -> None:
         """Mark a queued turn task as the active dispatch (queue worker entry)."""
         self.current_task = task
+        self.ensure_current_cancel_event()
         self.phase = TurnPhase.DISPATCHING
 
     def attach_cancel_event(self, cancel_event: threading.Event) -> None:
@@ -194,7 +237,10 @@ class ReplState:
 
     def clear_current_task(self, task: asyncio.Task[None] | None = None) -> None:
         if task is None or self.current_task is task:
+            preserve_goal_pause = self.exit_requested and self.is_goal_pause_requested()
             self.current_task = None
+            if not preserve_goal_pause:
+                self.current_cancel_event = None
             self.phase = TurnPhase.IDLE
 
     def finish_dispatch(self, cancel_event: threading.Event) -> None:
@@ -226,8 +272,7 @@ class ReplState:
 class SpinnerState:
     """Mutable state read by prompt callbacks for toolbar + inline spinner."""
 
-    # Braille by default; the host picks the set at construction (see
-    # ``infrastructure.terminal.spinner_frames``) for terminals that draw braille badly.
+    # Braille by default; a caller may pass its own frames at construction.
     _SPINNER_FRAMES: tuple[str, ...] = BRAILLE_SPINNER_FRAMES
     # One glyph advance per interval of *elapsed time*. The frame must be a
     # pure function of the clock, never of how often the prompt message

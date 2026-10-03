@@ -61,6 +61,9 @@ from integrations.github.tools.ci_fix.ship import PushResult, checkout_target_br
 from integrations.github.tools.ci_fix.storage.attempts import record_verification, repair_key
 from integrations.github.tools.ci_fix.verification import (
     DEFAULT_CHECK_WAIT_SECONDS,
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_REGISTRATION_SECONDS,
+    DEFAULT_SETTLE_SECONDS,
     CheckState,
     CheckVerification,
     wait_for_branch_checks,
@@ -378,14 +381,22 @@ def run_ci_fix(
     github_token: str | None = None,
     confirm_fn: Callable[[str], str] | None = None,
     allowed_paths: frozenset[str] | None = None,
+    expected_source_head_sha: str | None = None,
     console: Any = None,
+    registration_seconds: int = DEFAULT_REGISTRATION_SECONDS,
+    settle_seconds: int = DEFAULT_SETTLE_SECONDS,
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
+    check_wait = {
+        "registration_seconds": registration_seconds,
+        "settle_seconds": settle_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+    }
     with ExitStack() as workspaces:
         ws = workspace or coding_workspace()
         branch_name = (branch or "").strip()
         ctx: CiFixContext | None = None
         worktree: BranchWorktree | None = None
-        run_workspace = ws
         try:
             if branch_name and (pr_number is not None or pr_url):
                 raise GitHubCiFixError(
@@ -411,6 +422,11 @@ def run_ci_fix(
                     github_token=github_token,
                     allow_clean=True,
                 )
+            if expected_source_head_sha is not None and ctx.head_sha != expected_source_head_sha:
+                raise GitHubCiFixError(
+                    ERR_CHECKS_SUPERSEDED,
+                    "The remote source head changed before repair; no push was made.",
+                )
             ws = str(
                 workspaces.enter_context(
                     repair_workspace(
@@ -428,7 +444,7 @@ def run_ci_fix(
                 output = to_output(
                     restored, CodingResult(success=True, summary="Resumed repair verification")
                 )
-                return _verify_repair(restored, output, push, github_token)
+                return _verify_repair(restored, output, push, github_token, **check_wait)
             if not ctx.failing_checks and not ctx.needs_base_merge:
                 return error_output(
                     ERR_NO_FAILING_CHECKS, "No failing checks; no repair was needed.", ctx
@@ -468,10 +484,11 @@ def run_ci_fix(
                 baseline=baseline,
                 github_token=github_token,
                 already_committed=merge is not None or committed,
+                recorded_through=merge.commit_sha if merge is not None else ctx.head_sha,
             )
         except GitHubCiFixError as exc:
             return push_error_output(output, exc)
-        verified = _verify_repair(ctx, output, push, github_token)
+        verified = _verify_repair(ctx, output, push, github_token, **check_wait)
         if verified.get("checks_state") != CheckState.CONFLICTED.value:
             return verified
         return _merge_after_conflicted_push(
@@ -484,6 +501,7 @@ def run_ci_fix(
             github_token,
             allowed_paths,
             console=console,
+            **check_wait,
         )
 
 
@@ -573,6 +591,9 @@ def _merge_after_conflicted_push(
     github_token: str | None,
     allowed_paths: frozenset[str] | None = None,
     console: Any = None,
+    registration_seconds: int = DEFAULT_REGISTRATION_SECONDS,
+    settle_seconds: int = DEFAULT_SETTLE_SECONDS,
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
     """Bring the base into a pushed head GitHub reports as conflicted, push, and re-verify.
 
@@ -594,6 +615,7 @@ def _merge_after_conflicted_push(
             baseline=pre_coding_changes(workspace),
             github_token=github_token,
             already_committed=True,
+            recorded_through=merge.commit_sha,
         )
     except GitHubCiFixError as exc:
         base_branch = ctx.base_branch or "the base branch"
@@ -614,11 +636,26 @@ def _merge_after_conflicted_push(
     combined = replace(
         merged, changed_files=list(dict.fromkeys((*push.changed_files, *merged.changed_files)))
     )
-    return _verify_repair(ctx, output, combined, github_token)
+    return _verify_repair(
+        ctx,
+        output,
+        combined,
+        github_token,
+        registration_seconds=registration_seconds,
+        settle_seconds=settle_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
 
 
 def _verify_repair(
-    ctx: CiFixContext, output: dict[str, Any], push: PushResult, github_token: str | None
+    ctx: CiFixContext,
+    output: dict[str, Any],
+    push: PushResult,
+    github_token: str | None,
+    *,
+    registration_seconds: int = DEFAULT_REGISTRATION_SECONDS,
+    settle_seconds: int = DEFAULT_SETTLE_SECONDS,
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
     try:
         wait_for_checks = wait_for_branch_checks if ctx.is_branch_target else wait_for_pr_checks
@@ -626,6 +663,9 @@ def _verify_repair(
             ctx,
             github_token=github_token,
             expected_head_sha=push.head_sha,
+            registration_seconds=registration_seconds,
+            settle_seconds=settle_seconds,
+            poll_interval_seconds=poll_interval_seconds,
         )
     except GitHubCiFixError as exc:
         return {

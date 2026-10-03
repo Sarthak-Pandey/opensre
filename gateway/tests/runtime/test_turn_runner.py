@@ -11,11 +11,13 @@ from unittest.mock import MagicMock
 import pytest
 from rich.console import Console
 
+from config.constants.capabilities import HOSTED_GATEWAY_CAPABILITY
 from core.agent_harness.runtime import AgentBuildConfig
 from core.agent_harness.session import SessionCore
 from core.agent_harness.session.persistence.memory import InMemorySessionStore
 from core.agent_harness.turns.turn_results import ToolCallingTurnResult, TurnResult
 from infrastructure.turn_host.session_agents import SessionAgentPool
+from infrastructure.turn_host.session_lock import session_execution_lock
 from infrastructure.turn_host.turn_runner import TurnRunner
 from tests.core.agent.orchestration.cross_surface_parity_harness import (
     RecordingTurnOutput,
@@ -343,7 +345,7 @@ def test_turn_runner_tolerates_sinks_without_tool_hooks(monkeypatch: Any) -> Non
     assert agent.bind_turn.call_args.args[0].tool_hooks is None
 
 
-def test_turn_runner_disables_unsupported_gateway_capabilities(monkeypatch: Any) -> None:
+def test_turn_runner_leaves_gateway_capabilities_available(monkeypatch: Any) -> None:
     _patch_headless_agent(monkeypatch, _empty_turn_result())
     session = SessionCore(store=InMemorySessionStore())
     handler = TurnRunner(console=Console(force_terminal=False))
@@ -355,8 +357,7 @@ def test_turn_runner_disables_unsupported_gateway_capabilities(monkeypatch: Any)
         logging.getLogger("test"),
     )
 
-    assert session.available_capabilities["llm_provider"] == ()
-    assert session.available_capabilities["task_cancel"] == ()
+    assert session.available_capabilities == {HOSTED_GATEWAY_CAPABILITY: ()}
 
 
 def test_turn_runner_preserves_supported_capabilities(monkeypatch: Any) -> None:
@@ -379,14 +380,14 @@ def test_turn_runner_preserves_supported_capabilities(monkeypatch: Any) -> None:
         logging.getLogger("test.gateway.capabilities"),
     )
 
-    assert session.available_capabilities["llm_provider"] == ()
-    assert session.available_capabilities["task_cancel"] == ()
+    assert session.available_capabilities["llm_provider"] == ("existing-provider",)
+    assert session.available_capabilities["task_cancel"] == ("existing-cancel",)
 
     assert session.available_capabilities["shell_commands"] == ("shell",)
     assert session.available_capabilities["custom_gateway_capability"] == ("enabled",)
 
 
-def test_turn_runner_capability_gating_is_stable_across_turns(monkeypatch: Any) -> None:
+def test_turn_runner_keeps_capabilities_available_across_turns(monkeypatch: Any) -> None:
     _patch_headless_agent(monkeypatch, _empty_turn_result())
     session = SessionCore(store=InMemorySessionStore())
     session.available_capabilities["shell_commands"] = ("shell",)
@@ -397,9 +398,10 @@ def test_turn_runner_capability_gating_is_stable_across_turns(monkeypatch: Any) 
     handler("first turn", session, RecordingTurnOutput(), logger)
     handler("second turn", session, RecordingTurnOutput(), logger)
 
-    assert session.available_capabilities["llm_provider"] == ()
-    assert session.available_capabilities["task_cancel"] == ()
-    assert session.available_capabilities["shell_commands"] == ("shell",)
+    assert session.available_capabilities == {
+        "shell_commands": ("shell",),
+        HOSTED_GATEWAY_CAPABILITY: (),
+    }
 
 
 def test_turn_runner_emits_gateway_turn_analytics(monkeypatch: Any) -> None:
@@ -427,6 +429,55 @@ def test_turn_runner_emits_gateway_turn_analytics(monkeypatch: Any) -> None:
     assert len(completed) == 1
     assert completed[0]["surface"] == UsageSurface.SLACK
     assert completed[0]["answered"] is False
+
+
+class _RecordingAnalytics:
+    """Stands in for the analytics client and keeps every captured event."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(self, event: str, properties: dict[str, object] | None = None) -> None:
+        self.events.append((event, dict(properties or {})))
+
+
+def test_a_failed_turn_records_a_redacted_capped_error_message(monkeypatch: Any) -> None:
+    # Arrange: dispatch raises with a credential in a long message, and the real
+    # failure capture runs against a recording analytics client.
+    from infrastructure.analytics import capture
+    from infrastructure.analytics.events import Event
+    from infrastructure.analytics.usage_context import UsageSurface, bound_usage_context
+
+    analytics = _RecordingAnalytics()
+    monkeypatch.setattr(capture, "get_analytics", lambda: analytics)
+    monkeypatch.setattr(
+        "infrastructure.turn_host.turn_runner.capture_gateway_turn_failed",
+        capture.capture_gateway_turn_failed,
+    )
+    agent_cls = _patch_headless_agent(monkeypatch, _empty_turn_result())
+    token = "xoxb-" + "1" * 12 + "-" + "2" * 12 + "-" + "a" * 24
+    agent_cls.return_value.dispatch.side_effect = RuntimeError(
+        f"slack rejected {token}: " + "z" * 2000
+    )
+    handler = TurnRunner(console=Console(force_terminal=False))
+
+    # Act
+    with (
+        bound_usage_context(surface=UsageSurface.SLACK, user_id="U1"),
+        pytest.raises(RuntimeError),
+    ):
+        handler(
+            "hi", SessionCore(store=InMemorySessionStore()), MagicMock(), logging.getLogger("t")
+        )
+
+    # Assert
+    failed = [props for event, props in analytics.events if event == Event.GATEWAY_TURN_FAILED]
+    assert len(failed) == 1
+    message = str(failed[0]["error_message"])
+    assert failed[0]["error_type"] == "RuntimeError"
+    assert token not in message
+    assert message.startswith("slack rejected [REDACTED")
+    assert len(message) == 500
 
 
 def test_turn_runner_holds_the_session_lock_for_the_whole_turn(monkeypatch: Any) -> None:
@@ -562,6 +613,35 @@ def test_run_without_caller_context_is_the_transport_path(monkeypatch: Any) -> N
     assert binding.confirm_fn is None
 
 
+def test_run_waits_for_a_slot_when_told_to_instead_of_refusing(monkeypatch: Any) -> None:
+    """A queued remote prompt queues behind a running turn; only a timeout refuses it."""
+    # Arrange: the only slot is taken and freed a moment later
+    import threading
+
+    from infrastructure.turn_host.concurrency import AT_CAPACITY_MESSAGE, TurnConcurrencyGate
+
+    factory = _patch_headless_agent(monkeypatch, _empty_turn_result())
+    gate = TurnConcurrencyGate(1)
+    assert gate.try_acquire() is True
+    threading.Timer(0.2, gate.release).start()
+    handler = TurnRunner(console=Console(force_terminal=False), gate=gate)
+    sink = RecordingTurnOutput()
+
+    # Act
+    returned = handler.run(
+        "hello",
+        SessionCore(store=InMemorySessionStore()),
+        sink,
+        logging.getLogger("t"),
+        slot_wait_seconds=2.0,
+    )
+
+    # Assert: the turn ran once the slot freed; nothing was finalized as "at capacity"
+    assert returned is not None
+    assert sink.finalized != AT_CAPACITY_MESSAGE
+    factory.assert_called_once()
+
+
 def test_run_returns_none_and_says_at_capacity_when_the_gate_refuses(monkeypatch: Any) -> None:
     """At capacity the caller gets ``None``, not a result it would treat as a turn."""
     # Arrange
@@ -588,6 +668,62 @@ def test_run_returns_none_and_says_at_capacity_when_the_gate_refuses(monkeypatch
     assert sink.finalized == AT_CAPACITY_MESSAGE
     admission_check.assert_not_called()
     factory.assert_not_called()
+
+
+def test_waiting_on_session_lease_does_not_consume_global_capacity(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    """A resumed session waiting elsewhere leaves the sole slot for another turn."""
+    from infrastructure.turn_host.concurrency import TurnConcurrencyGate
+
+    monkeypatch.setattr(
+        "infrastructure.turn_host.session_lock.sessions_dir",
+        lambda: tmp_path,
+    )
+    handler = TurnRunner(console=Console(force_terminal=False), gate=TurnConcurrencyGate(1))
+    blocked_session = SessionCore(store=InMemorySessionStore())
+    available_session = SessionCore(store=InMemorySessionStore())
+    blocked_attempted = threading.Event()
+    available_dispatched = threading.Event()
+    errors: list[Exception] = []
+
+    def _run_turn(*_args: Any, **_kwargs: Any) -> TurnResult:
+        available_dispatched.set()
+        return _empty_turn_result()
+
+    monkeypatch.setattr(handler, "_run_turn", _run_turn)
+
+    def _run_blocked() -> None:
+        try:
+            blocked_attempted.set()
+            handler.run(
+                "blocked",
+                blocked_session,
+                RecordingTurnOutput(),
+                logging.getLogger("test.waiting-session-lease"),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    with session_execution_lock(blocked_session.session_id):
+        thread = threading.Thread(target=_run_blocked)
+        thread.start()
+        assert blocked_attempted.wait(timeout=1)
+        assert not available_dispatched.wait(timeout=0.2)
+
+        result = handler.run(
+            "available",
+            available_session,
+            RecordingTurnOutput(),
+            logging.getLogger("test.waiting-session-lease"),
+        )
+
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors, errors
+    assert result is not None
+    assert available_dispatched.is_set()
 
 
 def test_run_rejected_by_admission_never_starts_agent_work(monkeypatch: Any) -> None:

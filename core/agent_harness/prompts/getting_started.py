@@ -11,18 +11,29 @@ from core.agent_harness.prompts.skills import getting_started_skills
 
 GETTING_STARTED_CUSTOM = "Or type your own answer..."
 
-GETTING_STARTED_OPTIONS: tuple[str, ...] = tuple(
-    skill.getting_started or "" for skill in getting_started_skills()
-)
-GETTING_STARTED_MENU: tuple[str, ...] = (*GETTING_STARTED_OPTIONS, GETTING_STARTED_CUSTOM)
+
+def getting_started_options() -> tuple[str, ...]:
+    """Return the active catalog's demo labels in menu order."""
+    return tuple(skill.getting_started or "" for skill in getting_started_skills())
 
 
-def load_getting_started_block() -> str:
+def getting_started_menu() -> tuple[str, ...]:
+    """Return the demo labels followed by the custom-answer row."""
+    return (*getting_started_options(), GETTING_STARTED_CUSTOM)
+
+
+def load_getting_started_block(*, surface: str = "interactive_shell") -> str:
     """Separate capability answers, direct specialist requests, and guided onboarding."""
+    demo_guidance = (
+        "Do not offer a bare `/demo` command on this non-interactive surface. "
+        "For the guided demo, tell the user to run `opensre` first and then type `/demo`."
+        if surface == "headless_cli"
+        else "Offer /demo when a guided tour would help."
+    )
     return (
         "When the user asks what you can do, what you're capable of, how you can "
         "help, or what tools you have, answer from the available capabilities and "
-        "offer /demo. When the user names a demo or requests a specialist's work, "
+        f"{demo_guidance} When the user names a demo or requests a specialist's work, "
         "load that specialist directly and carry the original request forward. "
         "For an ambiguous CI request, clarify the desired outcome once. "
         "For an explicit demo or onboarding request that needs path selection, "
@@ -38,8 +49,8 @@ def load_getting_started_block() -> str:
 
 __all__ = [
     "GETTING_STARTED_CUSTOM",
-    "GETTING_STARTED_MENU",
-    "GETTING_STARTED_OPTIONS",
+    "getting_started_menu",
+    "getting_started_options",
     "getting_started_skills",
     "load_getting_started_block",
 ]

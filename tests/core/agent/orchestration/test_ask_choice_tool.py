@@ -14,6 +14,7 @@ from typing import Any
 
 from rich.console import Console
 
+from config.constants.ask_user import AskUserReason
 from core.agent_harness.tools.tool_context import (
     ACTION_TOOL_CONTEXT_RESOURCE_KEY,
     ActionToolScope,
@@ -82,6 +83,7 @@ def test_interactive_repl_defers_menu_to_choose_turn() -> None:
     assert session.pending_user_choice is not None
     assert session.pending_user_choice.title == _TITLE
     assert session.pending_user_choice.options == tuple(_OPTIONS)
+    assert session.pending_user_choice.reason_code == AskUserReason.CHOICE
     assert session.terminal.pending_prompt_default == "/choose"
     assert session.terminal.pending_prompt_autosubmit is True
 
@@ -108,7 +110,7 @@ def test_explicit_non_tty_turn_falls_back() -> None:
     assert session.pending_user_choice is None
 
 
-def test_headless_session_without_terminal_falls_back() -> None:
+def test_headless_session_without_deferred_choice_support_falls_back() -> None:
     session = InMemorySessionState()
     ctx = _ctx(session=session)
 
@@ -116,6 +118,19 @@ def test_headless_session_without_terminal_falls_back() -> None:
 
     assert result["ok"] is True
     assert result["menu"] == "unavailable"
+
+
+def test_headless_session_persists_deferred_choice() -> None:
+    session = InMemorySessionState()
+    session.available_capabilities["ask_user_choice"] = ("deferred",)
+    ctx = _ctx(session=session, is_tty=False)
+
+    result = execute_ask_user_choice_tool({"title": _TITLE, "options": _OPTIONS}, ctx)
+
+    assert result["ok"] is True
+    assert result["menu"] == "deferred"
+    assert session.pending_user_choice is not None
+    assert session.pending_user_choice.title == _TITLE
 
 
 def test_missing_title_is_rejected() -> None:

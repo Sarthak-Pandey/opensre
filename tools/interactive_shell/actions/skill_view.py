@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from core.agent_harness.spi.grounding import (
@@ -15,6 +16,7 @@ from core.tool import RegisteredTool, SideEffectLevel
 from core.tool_framework.utils import object_schema, string_property
 from tools.interactive_shell.action_names import ActionToolName
 from tools.interactive_shell.actions.skill_entry import enter_skill
+from tools.registry_skill_guidance import tool_guidance_tools
 
 
 def _view_skill_reference(name: str, reference: str) -> dict[str, Any]:
@@ -41,7 +43,12 @@ def _view_skill_reference(name: str, reference: str) -> dict[str, Any]:
     }
 
 
-def execute_skill_view_tool(args: dict[str, Any], ctx: ActionToolScope) -> dict[str, Any]:
+def execute_skill_view_tool(
+    args: dict[str, Any],
+    ctx: ActionToolScope,
+    *,
+    resolved_integrations: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     name = str(args.get("name", "")).strip()
     if not name:
         available = [skill.name for skill in list_action_skills()]
@@ -53,13 +60,38 @@ def execute_skill_view_tool(args: dict[str, Any], ctx: ActionToolScope) -> dict[
     reference = str(args.get("reference", "")).strip()
     if reference:
         return _view_skill_reference(name, reference)
-    return enter_skill(name, ctx, from_model=True)
+    if not any(skill.name == name for skill in list_action_skills()):
+        guided_tools = tool_guidance_tools(name)
+        if guided_tools:
+            return _already_loaded_guidance(name, guided_tools)
+    return enter_skill(name, ctx, from_model=True, resolved_integrations=resolved_integrations)
+
+
+def _already_loaded_guidance(name: str, guided_tools: tuple[str, ...]) -> dict[str, Any]:
+    """Guidance attached to tool descriptions has nothing to open; say so without failing."""
+    listed = ", ".join(guided_tools)
+    return {
+        "ok": True,
+        "name": name,
+        "already_loaded": True,
+        "tools": list(guided_tools),
+        "summary": f"{name} is tool guidance, already loaded",
+        "content": (
+            f"{name} is guidance attached to these tools: {listed}. There is no separate "
+            "skill to open: call the tool that fits the request."
+        ),
+    }
 
 
 def run_skill_view(*, name: str, reference: str = "", context: Any) -> dict[str, Any]:
-    return execute_with_action_context(
-        {"name": name, "reference": reference}, context, execute_skill_view_tool
-    )
+    # The prerequisite gate reads the integrations this turn's tools receive,
+    # so it agrees with the tools it protects.
+    resolved: Mapping[str, Any] | None = getattr(context, "resolved_integrations", None)
+
+    def execute(args: dict[str, Any], ctx: ActionToolScope) -> dict[str, Any]:
+        return execute_skill_view_tool(args, ctx, resolved_integrations=resolved)
+
+    return execute_with_action_context({"name": name, "reference": reference}, context, execute)
 
 
 skill_view_tool = RegisteredTool(

@@ -33,7 +33,8 @@ def test_loop_is_a_weekday_manual_loop_delivered_only_to_this_shell(store_path: 
     task = scheduled.loop.task
     assert scheduled.reused is False
     assert task.kind is TaskKind.MANUAL_LOOP
-    assert task.cron == "0 8 * * 1-5"
+    assert task.cron == "0 8 * * mon-fri"
+    assert ci_loop.loop_card(scheduled).details[0].startswith("Runs weekdays at 08:00 UTC")
     assert task.timezone == "UTC"
     assert scheduled.loop.channels == (Provider.INTERACTIVE_SHELL,)
     assert "acme/app" in task.params[LOOP_PROMPT_PARAM]
@@ -57,6 +58,13 @@ def test_scheduling_the_same_repository_again_reuses_the_loop(store_path: Path) 
     assert second.task_id == first.task_id
     assert len(list_tasks(store_path)) == 1
     assert ci_loop.loop_card(second).headline.startswith("Already scheduled")
+
+
+def test_saved_numeric_schedule_is_not_mislabeled_as_weekdays() -> None:
+    scheduled = _scheduled_stub("acme", "app")
+    scheduled.loop.task.cron = "0 8 * * 1-5"
+
+    assert ci_loop.loop_card(scheduled).details[0].startswith("Runs on cron 0 8 * * 1-5 UTC")
 
 
 def test_the_card_is_a_bulleted_list_not_a_paragraph(store_path: Path) -> None:
@@ -142,7 +150,7 @@ def _scheduled_stub(owner: str, repo: str) -> ci_loop.ScheduledLoop:
         id="task1",
         name=ci_loop.loop_name(owner, repo),
         kind=TaskKind.MANUAL_LOOP,
-        cron="0 8 * * 1-5",
+        cron="0 8 * * mon-fri",
         timezone="UTC",
         provider=Provider.INTERACTIVE_SHELL,
         window_hours=24,
@@ -213,7 +221,7 @@ def test_tool_puts_todays_snapshot_report_above_the_schedule_card(
 
     now = _write_report_snapshot(tmp_path, window_days=30)
     monkeypatch.setattr(tool_module, "snapshot_root", lambda _root=None: tmp_path)
-    monkeypatch.setattr(tool_module, "resolve_github_token", lambda _t=None: "")
+    monkeypatch.setattr(tool_module, "github_rest_token", lambda **_kw: "")
 
     def _schedule(*_a: object, **_k: object) -> ci_loop.ScheduledLoop:
         return _scheduled_stub("acme", "app")
@@ -403,7 +411,7 @@ def test_analyze_keeps_the_details_beside_the_comparison(
 
     report = _sample_report(window_days=30, now=datetime.now(UTC))
     monkeypatch.setattr(tool_module, "snapshot_root", lambda _root=None: tmp_path)
-    monkeypatch.setattr(tool_module, "resolve_github_token", lambda _t=None: "tok")
+    monkeypatch.setattr(tool_module, "github_rest_token", lambda **_kw: "tok")
 
     def _analyze(_owner: str, _repo: str, **_kwargs: Any) -> Any:
         return type("A", (), {"report": report, "runs_read": 3})()

@@ -22,6 +22,13 @@ It was extracted out of `interactive_shell` so the same harness can run the
 interactive terminal and be invoked headlessly via
 `agent_harness.turns.headless_agent`.
 
+## Prompt capture
+
+`turns.orchestrator.run_turn` owns prompt capture for every host through
+`infrastructure.analytics.prompt_log.lifecycle`. Keep one recorder per dispatch,
+including continuations, and restore parent correlation after nested turns.
+Hosts enrich the active recorder; only the shared lifecycle flushes it.
+
 ## Host API (teach this)
 
 Prefer `AgentSession.start()` / `start_embedded_session()` → `.chat` —
@@ -74,13 +81,36 @@ complete a step that had no tool return while it was `in_progress`
 (`task_plan/completion.py`, fed by `turns/plan_hooks.py`); a step marked
 `verifies` is never exempt, and a text-only closing step is exempt only once
 such a step completed. The second work tool of a turn with no open plan is
-refused (`task_plan/required.py`). A step newly marked `blocked` is resolved
-with the user, not skipped: the conclusion is rejected until `ask_user_choice`
+refused (`task_plan/required.py`). A response whose only tool call is
+`update_plan` is refused when that write sets a step `in_progress` or marks
+one `completed` (`task_plan/solo_advance.py`, hook in `turns/plan_hooks.py`);
+`plan_only`, an all-pending checklist, and a write that newly marks a step
+`blocked` still run, and a refused write is not stored. A step newly marked
+`blocked` is resolved with the user, not skipped: the conclusion is rejected
+until `ask_user_choice`
 is queued (`task_plan/conclusion.py`, gate in `turns/goal_review.py`). The
 onboarding menu's answer turn that only loaded the chosen demo skill is
 rejected once, with a nudge to write the plan and run its first step (same
-files). Change the rule in the
-owning leaf, never by prompt text alone.
+files). A work tool that failed (`ok: false`, nonzero shell exit) is not
+completion: `turns/work_outcome.py` rejects stop until a later work tool
+succeeds (`goal_review.py`), unless the failure is already the answer — a
+classified `work_outcome`, or a `tool_unavailable` envelope naming a
+`setup_command` the user must run first. The nudge follows the same gate
+order as the check, so a plan rejection gets the plan nudge. A
+`slash_invoke` that queues a picker or wizard as the user's next turn
+(`QUEUED_COMMAND_KEY` in its result) ends the turn like a queued menu
+(`turns/action_menu_end.py`); a `/goal` loop stops on that pending
+auto-submit and keeps it (`session_goal/run_until.py`). A slash command the
+execution gate declined returns `not_run` with no `error`: the duplicate
+guard still refuses the same call, and it is not plan evidence. Change the
+rule in the owning leaf, never by prompt text alone. Skills cannot override
+these gates.
+
+**Goal kernel (host-owned prompt, `prompts/action/goal_kernel.py`):** a
+short rule block that sits after the system prompt and again after any
+loaded skill. It tells the model to finish the user's request, match the
+asked field (stars ≠ forks), and not stop on a failed tool. A SKILL.md
+rewrite cannot remove it.
 
 **Evidence kinds (open/closed):** vocabulary + per-kind policy live in
 `turns/evidence_kind.py` (`EvidenceKind` + `EvidenceKindPolicy`). Add a kind by
@@ -108,6 +138,13 @@ changes; execution rechecks the active session. Settling the plan retires its
 helpers. A new user request clears active skill context, while menu answers
 and slash commands retain it. Full contract: `prompts/skills/AGENTS.md`.
 
+A turn held behind integration setup (a skill's prerequisite gate, or
+`/integrations setup <service>` deferred mid-skill) is parked as a
+`SetupResume` (`session/setup_resume.py`, via `spi.session_state`) on the
+shell's terminal facet only. The shell replays it at most once, after the
+prerequisite's registered check passes again; a typed turn, a closed menu, a
+new demo, and `/new` drop it. Never park skill-less prose or a slash command.
+
 Self-contained scheduled agent ticks set `SessionCore.skill_discovery_enabled`
 to `False` through `prepare_session`. This host-owned policy removes the skill
 index and `skill_view` while retaining execution tools; never infer it from
@@ -132,7 +169,9 @@ headless impl `InMemorySessionState`) — not `SessionStore`. Durable JSONL is
 **Host cancel:** one `threading.Event` on the output sink
 (`ensure_turn_cancel` / `host_cancel_requested` in `turns/host_cancel.py`) —
 tools (console `cancel_requested`), orchestrator, and stream guards all
-read that same Event. Do not invent a second cancel channel.
+read that same Event. Scheduled ticks write it when the stored task is
+disabled or removed (`PredicateCancelConsole`). Do not invent a second
+cancel channel.
 
 **Cloud scale-out:** more Fargate tasks (fleet), not unbound in-process
 concurrency or a new `chat` API.

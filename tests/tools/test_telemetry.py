@@ -119,6 +119,91 @@ class ToolFailureCase:
     expected_source: str
 
 
+def _ci_repair_demo_case(tool_name: str) -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from integrations.github.tools.ci_repair_demo import cleanup
+        from integrations.github.tools.ci_repair_demo import tool as mod
+
+        if tool_name == "seed_ci_repair_demo":
+            mp.setattr(mod, "configured_token", lambda _token: "token")
+            client = MagicMock()
+            client.request.side_effect = RuntimeError("github down")
+            mp.setattr(mod, "GitHubRestClient", lambda _token: client)
+            return
+        mp.setattr(cleanup, "results_directory", lambda: Path(tempfile.mkdtemp()))
+        mp.setattr(mod, "remove_task", MagicMock(side_effect=RuntimeError("storage unavailable")))
+
+    def invoke() -> dict[str, Any]:
+        from integrations.github.tools.ci_repair_demo import tool as mod
+
+        if tool_name == "seed_ci_repair_demo":
+            return mod.seed_ci_repair_demo(owner="octocat", repo="opensre-ci-repair-demo")
+        return mod.finish_ci_repair_demo(
+            repo="octocat/opensre-ci-repair-demo",
+            pr_number=1,
+            loop_id="abc",
+            outcome="failed",
+        )
+
+    return ToolFailureCase(tool_name, patch, invoke, tool_name, "github")
+
+
+def _probe_github_repair_access_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        from integrations.github.tools.repair_access import tool as mod
+
+        def _token(_explicit: str | None) -> str:
+            return "token"
+
+        client = MagicMock()
+        client.request_with_headers.side_effect = RuntimeError("github down")
+
+        def _client(_token_value: str) -> MagicMock:
+            return client
+
+        mp.setattr(mod, "configured_token", _token)
+        mp.setattr(mod, "GitHubRestClient", _client)
+
+    def invoke() -> dict[str, Any]:
+        from integrations.github.tools.repair_access import tool as mod
+
+        return mod.probe_github_repair_access()
+
+    return ToolFailureCase(
+        "probe_github_repair_access",
+        patch,
+        invoke,
+        "probe_github_repair_access",
+        "github",
+    )
+
+
+def _run_ci_repair_demo_case() -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        from integrations.github.tools.ci_repair_run import tool as mod
+
+        def _seed(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("seed down")
+
+        mp.setattr(mod, "seed_ci_repair_demo", _seed)
+
+    def invoke() -> dict[str, Any]:
+        from integrations.github.tools.ci_repair_run import tool as mod
+
+        return mod.run_ci_repair_demo(owner="octocat", repo="opensre-ci-repair-demo")
+
+    return ToolFailureCase(
+        "run_ci_repair_demo",
+        patch,
+        invoke,
+        "run_ci_repair_demo",
+        "github",
+    )
+
+
 def _ci_repair_case(tool_name: str) -> ToolFailureCase:
     def patch(mp: pytest.MonkeyPatch) -> None:
         from integrations.github.tools.ci_repair_loop import tool as mod
@@ -762,10 +847,47 @@ def _runbook_guidance_case() -> ToolFailureCase:
     )
 
 
+def _hosted_gateway_case(tool_name: str) -> ToolFailureCase:
+    def patch(mp: pytest.MonkeyPatch) -> None:
+        from integrations.hosted_gateway import HostedGatewayClient, HostedGatewayError
+
+        mp.setattr(
+            HostedGatewayClient,
+            "from_account",
+            MagicMock(side_effect=HostedGatewayError("unreachable")),
+        )
+
+    def invoke() -> dict[str, Any]:
+        from integrations.hosted_gateway.tools import (
+            gateway_health,
+            gateway_lifecycle,
+            gateway_prompt,
+        )
+
+        if tool_name == "ask_hosted_gateway":
+            return gateway_prompt.ask_hosted_gateway(prompt="which tasks run?")
+        tools = {
+            "check_hosted_gateway": gateway_health.check_hosted_gateway,
+            "start_hosted_gateway": gateway_lifecycle.start_hosted_gateway,
+            "stop_hosted_gateway": gateway_lifecycle.stop_hosted_gateway,
+        }
+        return tools[tool_name]()
+
+    return ToolFailureCase(tool_name, patch, invoke, tool_name, "opensre")
+
+
 _TOOL_FAILURE_CASES: list[ToolFailureCase] = [
     _azure_case(),
+    _hosted_gateway_case("check_hosted_gateway"),
+    _hosted_gateway_case("start_hosted_gateway"),
+    _hosted_gateway_case("stop_hosted_gateway"),
+    _hosted_gateway_case("ask_hosted_gateway"),
     _ci_repair_case("schedule_ci_repair_loop"),
     _ci_repair_case("get_ci_repair_loop"),
+    _ci_repair_demo_case("seed_ci_repair_demo"),
+    _ci_repair_demo_case("finish_ci_repair_demo"),
+    _probe_github_repair_access_case(),
+    _run_ci_repair_demo_case(),
     _openobserve_case(),
     _snowflake_case(),
     _cloudwatch_logs_case(),
@@ -969,6 +1091,14 @@ _MIGRATED_TOOL_NAMES: frozenset[str] = frozenset(
         "scan_github_ci_health",
         "schedule_ci_repair_loop",
         "get_ci_repair_loop",
+        "seed_ci_repair_demo",
+        "finish_ci_repair_demo",
+        "probe_github_repair_access",
+        "run_ci_repair_demo",
+        "check_hosted_gateway",
+        "start_hosted_gateway",
+        "stop_hosted_gateway",
+        "ask_hosted_gateway",
         # EKS — enumerated in #1463
         "list_eks_clusters",
         "describe_eks_cluster",
@@ -1015,6 +1145,9 @@ _TOOLS_WITHOUT_DELIBERATE_CATCH: frozenset[str] = frozenset(
         # unknown key); a parser failure it did not anticipate reaches the
         # global wrapper.
         "read_structured_file",
+        # list_scheduled_loops reads the local task store and lets any store
+        # error reach the global wrapper.
+        "list_scheduled_loops",
         # scan_local_git_workspace shells out to git per repository and lets
         # anything unexpected reach the global wrapper.
         "scan_local_git_workspace",
@@ -1225,7 +1358,6 @@ _TOOLS_WITHOUT_DELIBERATE_CATCH: frozenset[str] = frozenset(
         "read_yc_db_logs",
         "read_yc_logs",
         "query_yc_metrics",
-        "redeploy_railway_service",
         "replay_slack_thread_locally",
         "scan_redis_keys",
         "search_bitbucket_code",

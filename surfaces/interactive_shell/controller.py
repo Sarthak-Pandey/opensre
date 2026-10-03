@@ -12,8 +12,17 @@ from prompt_toolkit import PromptSession
 from rich.console import Console
 
 from config.repl_config import ReplConfig
+from core.agent_harness.spi.session_goal import (
+    pause_active_session_goal,
+    session_goal_is_active,
+)
+from core.agent_harness.spi.session_state import clear_setup_resume
 from core.agent_harness.spi.task_plan import discard_task_plan
 from core.domain.alerts import inbox as _alert_inbox
+from infrastructure.turn_host.session_lock import (
+    SessionExecutionBusyError,
+    session_execution_lock,
+)
 from surfaces.interactive_shell.runtime.background.workers import BackgroundTaskPool
 from surfaces.interactive_shell.runtime.ci_fix_status import bind_ci_fix_status
 from surfaces.interactive_shell.runtime.context import (
@@ -34,6 +43,7 @@ from surfaces.interactive_shell.runtime.input.actions import (
     DeliverConfirmation,
     IgnoreInput,
     InputAction,
+    PauseGoal,
     SubmitTurn,
 )
 from surfaces.interactive_shell.runtime.loop_scheduler import (
@@ -51,6 +61,8 @@ from surfaces.interactive_shell.ui import DIM
 from surfaces.interactive_shell.ui.input_prompt.stdout import patch_prompt_stdout
 
 log = logging.getLogger(__name__)
+
+_GOAL_PAUSE_LOCK_RETRY_SECONDS = 0.1
 
 
 @contextmanager
@@ -248,6 +260,7 @@ class InteractiveShellController:
             lambda: run_agent_turn_queue(
                 state=self.state,
                 run_turn=lambda text: run_agent_turn(self.turn_runtime, text),
+                on_goal_pause=self._apply_goal_pause_at_turn_boundary,
             )
         )
         # Fleet sampler is lazy: /fleet triggers it on first live use.
@@ -257,6 +270,23 @@ class InteractiveShellController:
         except Exception as exc:  # noqa: BLE001
             log.warning("Loop scheduler could not start: %s", exc)
         self._ci_fix_status_cleanup = bind_ci_fix_status(self.session.terminal)
+
+    def _try_pause_goal_after_worker_release(self) -> bool:
+        """Pause and persist if the turn worker has released session ownership."""
+        from core.agent_harness import SessionManager
+
+        try:
+            with session_execution_lock(self.session.session_id, timeout=0):
+                if pause_active_session_goal(self.session) is not None:
+                    SessionManager.for_session(self.session).flush(self.session)
+        except SessionExecutionBusyError:
+            return False
+        return True
+
+    async def _apply_goal_pause_at_turn_boundary(self) -> None:
+        """Serialize a durable pause without making shutdown wait on the worker."""
+        while not await asyncio.to_thread(self._try_pause_goal_after_worker_release):
+            await asyncio.sleep(_GOAL_PAUSE_LOCK_RETRY_SECONDS)
 
     async def _handle_input_action(self, action: InputAction) -> bool:
         match action:
@@ -268,6 +298,18 @@ class InteractiveShellController:
                 if text:
                     self.prompt.render_submitted_prompt(self.echo_console, text)
                 self.state.cancel_current_dispatch()
+                return True
+            case PauseGoal(submitted_text=text):
+                # Keep slash execution serialized through the normal turn
+                # queue, but signal current work now. The queue owner applies
+                # the state transition after the worker thread returns, before
+                # any already-queued input, so goal tools remain single-owner.
+                self.prompt.render_submitted_prompt(self.echo_console, text)
+                self.state.request_goal_pause(
+                    interrupt=session_goal_is_active(self.session),
+                )
+                self.session.terminal.pending_inflight_goal_pauses += 1
+                await self.state.queue.put(text)
                 return True
             case DeliverConfirmation(text=text):
                 self.state.deliver_confirmation(text)
@@ -282,6 +324,8 @@ class InteractiveShellController:
                     # round counter so the two-round cap is per-request, not per-session.
                     self.session.ask_user_rounds = 0
                     self.session.terminal.pending_choice_response = None
+                    # The user moved on, so a turn parked behind setup is not replayed.
+                    clear_setup_resume(self.session)
                     # Clear a finished plan left pinned after the previous turn so
                     # it does not linger over this one. An unfinished plan stays:
                     # the operator may continue it or type ``go`` while idle.

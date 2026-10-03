@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
+from core.agent_harness.turns.action_driver import _deferred_reply_presenter, _show_response
+from core.agent_harness.turns.skill_value import record_skill_value
 from gateway.transports.slack.client import (
     SLACK_MAX_MARKDOWN_BLOCK_CHARS,
     SLACK_MAX_MESSAGE_CHARS,
@@ -88,6 +92,26 @@ def _sink(client: _FakeMessagingClient) -> SlackTurnOutput:
         thread_ts="1700.100",
         update_interval_seconds=0.0,
     )
+
+
+def test_failed_slack_delivery_does_not_credit_skill_insight() -> None:
+    report = "What insights stand out:\n- CI failures account for 0.5% of PR runs."
+    session = SimpleNamespace(active_skill="analyzing-github-ci-performance")
+    client = _FakeMessagingClient(post_ok=False, update_ok=False)
+    sink = _sink(client)
+    with patch("core.agent_harness.turns.skill_value.capture_skill_value_delivered") as capture:
+        replies: list[str] = []
+        present = _deferred_reply_presenter(
+            sink, replies, lambda text: record_skill_value(session, text, set())
+        )
+        assert not present(report)
+        assert replies == []
+        assert _show_response(sink, handled=True, final_text=report, display_chunks=[report]) == ""
+        capture.assert_not_called()
+
+        client.post_ok = True
+        assert present(report)
+        assert capture.call_count == 1
 
 
 def test_posts_status_placeholder_into_thread_on_creation() -> None:
@@ -200,6 +224,17 @@ def test_finalize_appends_feedback_buttons_after_footer() -> None:
     assert element["type"] == "feedback_buttons"
     assert element["positive_button"]["value"] == "good"
     assert element["negative_button"]["value"] == "bad"
+
+
+def test_status_updates_omit_the_argument_row() -> None:
+    client = _FakeMessagingClient()
+    sink = _sink(client)
+
+    sink.set_tool_status("⏳ Run a local shell command…\n(echo sk-secret-token)")
+
+    status = client.updates[-1]["text"]
+    assert "sk-secret-token" not in status
+    assert "Run a local shell command" in status
 
 
 def test_status_updates_render_as_italic_meta_text() -> None:

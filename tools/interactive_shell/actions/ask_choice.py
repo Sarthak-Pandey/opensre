@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from config.constants.ask_user import AskUserReason
 from core.agent_harness.spi.handoff import AskUserQuestion, parse_ask_user_answers, question_key
 from core.agent_harness.spi.session_state import (
     PendingUserChoice,
@@ -59,6 +60,10 @@ _QUEUED_BATCH_INSTRUCTION = (
     "NOT call update_plan yet. The user's answers arrive as the next user "
     "message. After they arrive, call update_plan then execute."
 )
+_DEFERRED_INSTRUCTION = (
+    "The host will render this required choice after the turn and persist it for "
+    "a later invocation. End the turn now without repeating the question or options."
+)
 
 _QUESTION_ITEM_SCHEMA = {
     "type": "object",
@@ -92,7 +97,7 @@ _QUESTION_ITEM_SCHEMA = {
 }
 
 
-def _menu_available(ctx: ActionToolScope) -> bool:
+def menu_available(ctx: ActionToolScope) -> bool:
     """True when the REPL can render the deferred ``/choose`` picker.
 
     Mirrors ``_slash_drives_interactive_picker``: gateway/headless sessions have
@@ -103,6 +108,11 @@ def _menu_available(ctx: ActionToolScope) -> bool:
         return False
     ports = ctx.slash_ports
     return ports is not None and bool(ports.tty_interactive())
+
+
+def _deferred_choice_available(ctx: ActionToolScope) -> bool:
+    capabilities = getattr(ctx.session, "available_capabilities", {})
+    return "deferred" in capabilities.get("ask_user_choice", ())
 
 
 def _parse_options(raw: object) -> list[str]:
@@ -211,7 +221,17 @@ def _already_answered_error(answered: dict[str, str]) -> str:
     )
 
 
-def execute_ask_user_choice_tool(args: dict[str, Any], ctx: ActionToolScope) -> dict[str, Any]:
+def execute_ask_user_choice_tool(
+    args: dict[str, Any],
+    ctx: ActionToolScope,
+    *,
+    reason_code: AskUserReason = AskUserReason.CHOICE,
+) -> dict[str, Any]:
+    """Queue the menu ``args`` describe; ``reason_code`` says who opened it.
+
+    The model's tool call keeps the default ``choice``; a host that opens a menu
+    through this executor passes its own reason.
+    """
     questions, questions_error = _parse_questions(args.get("questions"))
     if questions_error is not None:
         return {"ok": False, "error": questions_error}
@@ -269,6 +289,7 @@ def execute_ask_user_choice_tool(args: dict[str, Any], ctx: ActionToolScope) -> 
             title=header,
             options=questions[0].options,
             questions=tuple(questions),
+            reason_code=reason_code,
         )
         queued = _QUEUED_BATCH_INSTRUCTION
         summary = f"Ask User menu queued: {len(questions)} questions"
@@ -284,11 +305,14 @@ def execute_ask_user_choice_tool(args: dict[str, Any], ctx: ActionToolScope) -> 
             multi_select=multi_select,
             note=strip_terminal_controls(str(args.get("note", ""))).strip(),
             custom_answer=_parse_bool(args.get("allow_custom"), default=True),
+            reason_code=reason_code,
         )
         queued = _QUEUED_INSTRUCTION
         summary = f"selection menu queued: {title}"
 
-    if not _menu_available(ctx):
+    menu_open = menu_available(ctx)
+    deferred = _deferred_choice_available(ctx)
+    if not menu_open and not deferred:
         return {"ok": True, "menu": "unavailable", "instruction": _FALLBACK_INSTRUCTION}
 
     ctx.session.pending_user_choice = pending
@@ -298,6 +322,13 @@ def execute_ask_user_choice_tool(args: dict[str, Any], ctx: ActionToolScope) -> 
         by_skill.setdefault(skill, set()).update(question_key(q.title) for q in pending.items())
     if questions:
         ctx.session.ask_user_rounds = getattr(ctx.session, "ask_user_rounds", 0) + 1
+    if deferred and not menu_open:
+        return {
+            "ok": True,
+            "menu": "deferred",
+            "summary": summary,
+            "instruction": _DEFERRED_INSTRUCTION,
+        }
     set_auto_command(ctx.session, _CHOOSE_COMMAND)
     terminal = session_terminal(ctx.session)
     if terminal is not None:
@@ -435,5 +466,6 @@ ask_user_choice_tool = RegisteredTool(
 __all__ = [
     "ask_user_choice_tool",
     "execute_ask_user_choice_tool",
+    "menu_available",
     "run_ask_user_choice",
 ]

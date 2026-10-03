@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -40,6 +40,7 @@ from surfaces.cli.telemetry import (
     capture_exception,
     capture_first_run_if_needed,
     load_structured_error_type,
+    record_install_marker_state,
     render_landing,
     render_structured_error,
     report_exception,
@@ -63,13 +64,9 @@ _RECORD_INSTALL_ONLY = "record_install_only"
 _AFTER_BANNER = "after_banner"
 
 
-def _cli_invoked_properties(ctx: click.Context) -> Properties:
-    raw_argv = ctx.obj.get(_CLI_ARGV, []) if ctx.obj else []
-    command_parts = resolve_command_parts(
-        ctx.command,
-        raw_argv if isinstance(raw_argv, list) else [],
-    )
+def _cli_invoked_properties(ctx: click.Context, command_parts: list[str]) -> Properties:
     obj = ctx.obj if ctx.obj else {}
+    interactive_option = obj.get("interactive")
     return build_cli_invoked_properties(
         entrypoint="opensre",
         command_parts=command_parts,
@@ -77,7 +74,12 @@ def _cli_invoked_properties(ctx: click.Context) -> Properties:
         verbose=bool(obj.get("verbose", False)),
         debug=bool(obj.get("debug", False)),
         yes=bool(obj.get("yes", False)),
-        interactive=bool(obj.get("interactive", True)),
+        interactive=interactive_option if isinstance(interactive_option, bool) else None,
+        interactive_option_source=(
+            source.name.lower()
+            if (source := ctx.get_parameter_source("interactive"))
+            else "unknown"
+        ),
     )
 
 
@@ -87,10 +89,16 @@ def _capture_accepted_cli_invocation(ctx: click.Context) -> None:
     if ctx.obj.get(_CLI_ANALYTICS_CAPTURED, False):
         return
     ctx.obj[_CLI_ANALYTICS_CAPTURED] = True
+    if ctx.obj.get(_RECORD_INSTALL_ONLY, False):
+        record_install_marker_state()
     capture_first_run_if_needed()
     if ctx.obj.get(_RECORD_INSTALL_ONLY, False):
         return
-    capture_cli_invoked(_cli_invoked_properties(ctx))
+    raw_argv = ctx.obj.get(_CLI_ARGV, [])
+    command_parts = resolve_command_parts(
+        ctx.command, raw_argv if isinstance(raw_argv, list) else []
+    )
+    capture_cli_invoked(_cli_invoked_properties(ctx, command_parts), command_parts)
 
 
 def _repl_preference(
@@ -173,6 +181,12 @@ def _run_without_subcommand(
 @click.option("--debug", is_flag=True, help="Print debug-level logs and traces.")
 @click.option("--yes", "-y", is_flag=True, help="Auto-confirm all interactive prompts.")
 @click.option(
+    "--skip-onboarding",
+    "skip_onboarding",
+    is_flag=True,
+    help="Skip the startup demo questions (run /demo to open them later).",
+)
+@click.option(
     "--interactive/--no-interactive",
     default=True,
     help="Disable the interactive shell and print the landing page instead.",
@@ -209,6 +223,13 @@ def _run_without_subcommand(
     hidden=True,
     help="Record installer analytics and exit.",
 )
+@click.option(
+    "--github-connection-id",
+    type=click.UUID,
+    default=None,
+    metavar="UUID",
+    help="Use this workspace GitHub connection in the shell or cloud request.",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -216,19 +237,27 @@ def cli(
     verbose: bool,
     debug: bool,
     yes: bool,
+    skip_onboarding: bool,
     interactive: bool,
     resume_session_id: str | None,
     sync_on_exit: bool,
     layout: str | None,
     theme: str | None,
     record_install: bool,
+    github_connection_id: Any = None,
 ) -> None:
     """OpenSRE - open-source SRE agent."""
     ctx.ensure_object(dict)
+    from infrastructure.harness_providers.integration_selection import bound_github_connection
+
+    ctx.with_resource(
+        bound_github_connection(str(github_connection_id) if github_connection_id else None)
+    )
     ctx.obj["json"] = json_output
     ctx.obj["verbose"] = verbose
     ctx.obj["debug"] = debug
     ctx.obj["yes"] = yes
+    ctx.obj["skip_onboarding"] = skip_onboarding
     ctx.obj["interactive"] = interactive
     ctx.obj[_RECORD_INSTALL_ONLY] = record_install
 

@@ -227,6 +227,7 @@ def test_api_error_keeps_its_identity_and_details_across_context_manager_cleanup
     assert caught.value.__cause__ is http_error
     assert caught.value.__traceback__ is not None
     assert caught.value.status_code == HTTPStatus.FORBIDDEN
+    assert caught.value.method == "GET"
     assert caught.value.path == "/repos/o/r/actions/runs"
     assert caught.value.rate_limit_remaining == "0"
     assert caught.value.rate_limit_reset == "123"
@@ -250,6 +251,19 @@ def test_request_accept_header_can_be_overridden(monkeypatch: pytest.MonkeyPatch
         accept="application/vnd.github.star+json",
     ) == [{"starred_at": "2026-07-27T00:00:00Z"}]
     assert seen_accept == "application/vnd.github.star+json"
+
+
+def test_request_with_headers_returns_oauth_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(_req: request.Request, timeout: int = 0) -> _Response:  # noqa: ARG001
+        return _Response({"login": "octocat"}, headers={"X-OAuth-Scopes": "repo, workflow"})
+
+    monkeypatch.setattr("integrations.github.client.request.urlopen", fake_urlopen)
+    client = GitHubRestClient(github_token="tok")
+
+    payload, headers = client.request_with_headers("GET", "user")
+
+    assert payload == {"login": "octocat"}
+    assert headers["X-OAuth-Scopes"] == "repo, workflow"
 
 
 def test_invalid_json_raises_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:

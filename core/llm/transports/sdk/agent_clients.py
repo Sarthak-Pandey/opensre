@@ -54,10 +54,6 @@ from core.llm.types import AgentLLMResponse, ModelType, SchemaDescribedTool, Too
 
 logger = logging.getLogger(__name__)
 
-# The runtime executes one action per response (``core.tool.execution``); ask
-# the model for one tool call so the batch is never generated and rejected.
-ANTHROPIC_SINGLE_TOOL_CHOICE: dict[str, Any] = {"type": "auto", "disable_parallel_tool_use": True}
-
 
 def _anthropic_tool_schema(tool: Any) -> dict[str, Any]:
     return {
@@ -190,7 +186,6 @@ class AnthropicAgentClient:
             kwargs["system"] = _anthropic_cached_system(system) if cache else system
         if tools:
             kwargs["tools"] = _anthropic_tools_with_cache(tools) if cache else tools
-            kwargs["tool_choice"] = ANTHROPIC_SINGLE_TOOL_CHOICE
 
         backoff = _RETRY_INITIAL_BACKOFF_SEC
         last_err: Exception | None = None
@@ -517,7 +512,7 @@ class BedrockConverseAgentClient:
 
 
 _OPENAI_O_SERIES_RE = re.compile(r"(?:^|[^A-Za-z0-9])o\d", re.IGNORECASE)
-_OPENAI_GPT5_RE = re.compile(r"(?:^|[^A-Za-z0-9])gpt-5", re.IGNORECASE)
+_OPENAI_GPT5_PLUS_RE = re.compile(r"(?:^|[^A-Za-z0-9])gpt-[56]", re.IGNORECASE)
 
 
 def _supports_openai_parallel_tool_calls_param(api_key_env: str) -> bool:
@@ -526,13 +521,13 @@ def _supports_openai_parallel_tool_calls_param(api_key_env: str) -> bool:
 
 
 def _openai_max_token_kwarg(model: str) -> str:
-    # OpenAI o-series (o1, o3, o4-mini, …) and gpt-5 series reject max_tokens.
+    # OpenAI o-series (o1, o3, o4-mini, …) and gpt-5/gpt-6 series reject max_tokens.
     # O-series: matches a bare ``o<digit>`` token at the start of the name or
     # following a non-alphanumeric separator, so vendor-prefixed routes
     # (``openai/o4-mini``, ``azure/o3``) and custom deployments are detected.
-    # gpt-5: matches ``gpt-5`` at the start or after a separator, covering
-    # gpt-5, gpt-5o, gpt-5o-mini, and future gpt-5* variants.
-    if _OPENAI_O_SERIES_RE.search(model) or _OPENAI_GPT5_RE.search(model):
+    # gpt-5/gpt-6: matches ``gpt-5``/``gpt-6`` at the start or after a separator,
+    # covering gpt-5, gpt-5o, gpt-5o-mini, gpt-6, gpt-6-luna and future variants.
+    if _OPENAI_O_SERIES_RE.search(model) or _OPENAI_GPT5_PLUS_RE.search(model):
         return "max_completion_tokens"
     return "max_tokens"
 
@@ -561,16 +556,39 @@ class OpenAIAgentClient:
         api_key_default: str = "",
         credential_resolver: Callable[[str], str] | None = None,
     ) -> None:
-        from openai import OpenAI
-
         from config.llm_credentials import resolve_env_credential
 
         resolver = credential_resolver or resolve_env_credential
-        api_key = resolver(api_key_env) or api_key_default
-        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=AGENT_CLIENT_TIMEOUT_SEC)
+        self._credential_resolver = resolver
+        self._api_key_default = api_key_default
+        self._base_url = base_url
+        self._api_key_env = api_key_env
+        self._api_key = ""
+        self._client: Any = None
         self._model = model
         self._max_tokens = max_tokens
-        self._api_key_env = api_key_env
+        self._ensure_client()
+
+    def _ensure_client(self) -> None:
+        """Refresh the SDK client when the account token rotates."""
+        from openai import OpenAI
+
+        resolver = getattr(self, "_credential_resolver", None)
+        if resolver is None:
+            return
+        api_key = resolver(self._api_key_env) or self._api_key_default
+        if not api_key:
+            raise RuntimeError(
+                "Missing LLM credentials. Sign in with `opensre account login` "
+                f"or set {self._api_key_env}."
+            )
+        if self._client is None or api_key != self._api_key:
+            self._api_key = api_key
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=self._base_url,
+                timeout=AGENT_CLIENT_TIMEOUT_SEC,
+            )
 
     @property
     def model_id(self) -> str | None:
@@ -599,6 +617,10 @@ class OpenAIAgentClient:
         """Return a text description of an image via this provider's vision model."""
         import base64
 
+        from core.llm.hosted_credits import admit_hosted_credits
+
+        admit_hosted_credits()
+        self._ensure_client()
         data_url = f"data:{mimetype};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         messages: Any = [
             {
@@ -625,6 +647,9 @@ class OpenAIAgentClient:
         system: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AgentLLMResponse:
+        from core.llm.hosted_credits import admit_hosted_credits
+
+        admit_hosted_credits()
         from openai import (
             AuthenticationError,
             BadRequestError,
@@ -633,6 +658,7 @@ class OpenAIAgentClient:
             RateLimitError,
         )
 
+        self._ensure_client()
         msgs = strip_internal_message_markers(messages)
         if system:
             msgs = [{"role": "system", "content": system}] + msgs
@@ -648,7 +674,7 @@ class OpenAIAgentClient:
             if tools:
                 kwargs["tools"] = responses_tool_specs(tools)
                 kwargs["tool_choice"] = "auto"
-                kwargs["parallel_tool_calls"] = False
+                kwargs["parallel_tool_calls"] = True
             from config.llm_reasoning_effort import get_active_reasoning_effort
 
             reasoning_effort = get_active_reasoning_effort()
@@ -664,7 +690,7 @@ class OpenAIAgentClient:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
                 if _supports_openai_parallel_tool_calls_param(api_key_env):
-                    kwargs["parallel_tool_calls"] = False
+                    kwargs["parallel_tool_calls"] = True
 
         backoff = _RETRY_INITIAL_BACKOFF_SEC
         last_err: Exception | None = None

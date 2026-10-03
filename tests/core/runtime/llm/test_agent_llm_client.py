@@ -289,8 +289,8 @@ def test_anthropic_invoke_marks_system_and_last_tool_for_prompt_cache(
     assert api_tools[1]["cache_control"] == {"type": "ephemeral"}
     # Caller-owned tool dicts must not be mutated.
     assert "cache_control" not in tools[1]
-    # One action per response: the model is asked for a single tool call.
-    assert captured["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
+    # Multi-call responses are allowed: no single-call tool_choice override.
+    assert "tool_choice" not in captured
 
 
 def test_openai_agent_client_invoke_strips_internal_message_markers(
@@ -441,6 +441,36 @@ def test_opensre_payment_required_raises_upgrade_error_without_retry(
 
     assert call_count == 1
     assert excinfo.value.upgrade_url == upgrade_url
+
+
+def test_openai_agent_client_rebuilds_when_the_account_token_rotates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _install_fake_openai(monkeypatch)
+    keys: list[str] = []
+
+    class TrackingOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, timeout: float) -> None:
+            _ = base_url, timeout
+            keys.append(api_key)
+            self.chat = types.SimpleNamespace(
+                completions=types.SimpleNamespace(
+                    create=lambda **_: _make_fake_openai_response(content="ok")
+                )
+            )
+
+    fake.OpenAI = TrackingOpenAI
+    tokens = iter(["osre_pat_one", "osre_pat_two"])
+    client = OpenAIAgentClient(
+        model="gpt-5.4-mini",
+        api_key_env="OPENSRE_ACCOUNT_TOKEN",
+        credential_resolver=lambda _name: next(tokens),
+        base_url="https://app.opensre.com/api/llm/v1",
+    )
+
+    assert keys == ["osre_pat_one"]
+    client.invoke(messages=[{"role": "user", "content": "hi"}])
+    assert keys == ["osre_pat_one", "osre_pat_two"]
 
 
 def test_anthropic_rate_limit_honors_retry_after_header(
@@ -661,7 +691,7 @@ def test_openai_agent_client_invoke_raw_content_preserves_extra_fields(
     assert first_tc.get("thought_signature") == "abc123"
 
 
-def test_openai_agent_client_disables_parallel_tool_calls_for_openai(
+def test_openai_agent_client_enables_parallel_tool_calls_for_openai(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_openai(monkeypatch)
@@ -685,7 +715,7 @@ def test_openai_agent_client_disables_parallel_tool_calls_for_openai(
     )
 
     assert captured["tool_choice"] == "auto"
-    assert captured["parallel_tool_calls"] is False
+    assert captured["parallel_tool_calls"] is True
 
 
 def test_openai_gpt_5_6_agent_uses_responses_api_and_replays_reasoning(
@@ -767,7 +797,7 @@ def test_openai_gpt_5_6_agent_uses_responses_api_and_replays_reasoning(
     assert first.tool_calls[0].input == {"service": "api"}
     assert second.content == "done"
     assert captured[0]["max_output_tokens"] == 4096
-    assert captured[0]["parallel_tool_calls"] is False
+    assert captured[0]["parallel_tool_calls"] is True
     assert captured[0]["reasoning"] == {"effort": "high"}
     assert captured[0]["tools"] == [
         {
@@ -825,7 +855,7 @@ def test_openai_agent_client_omits_parallel_tool_calls_for_compat_provider(
 def test_openai_o_series_uses_max_completion_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """o-series and gpt-5 series models must receive max_completion_tokens, not max_tokens."""
+    """o-series and gpt-5/gpt-6 series models must receive max_completion_tokens."""
     _install_fake_openai(monkeypatch)
 
     captured: dict = {}
@@ -852,6 +882,10 @@ def test_openai_o_series_uses_max_completion_tokens(
         "gpt-5",
         "gpt-5o",
         "gpt-5o-mini",
+        "gpt-6",
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "openai/gpt-6-luna",
     ):
         captured.clear()
         client._model = model

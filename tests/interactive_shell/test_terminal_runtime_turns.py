@@ -38,6 +38,8 @@ def test_turn_needs_exclusive_stdin_for_bare_integration_menu(
     assert loop_input_policy.turn_needs_exclusive_stdin("/theme", session) is True
 
     assert loop_input_policy.turn_needs_exclusive_stdin("/integrations list", session) is False
+    # Typed bare `/model set` opens the provider picker.
+    assert loop_input_policy.turn_needs_exclusive_stdin("/model set", session) is True
     assert loop_input_policy.turn_needs_exclusive_stdin("/loops active", session) is True
     assert loop_input_policy.turn_needs_exclusive_stdin("/loops messages", session) is True
     assert loop_input_policy.turn_needs_exclusive_stdin("/loops show", session) is True
@@ -60,6 +62,7 @@ def test_turn_needs_exclusive_stdin_for_exit_commands(
 
     assert loop_input_policy.turn_needs_exclusive_stdin("/exit", session) is True
     assert loop_input_policy.turn_needs_exclusive_stdin("/quit", session) is True
+    assert loop_input_policy.turn_needs_exclusive_stdin("/logout", session) is True
     # Bare command words are not recognized under literal-/slash gating.
     assert loop_input_policy.turn_needs_exclusive_stdin("quit", session) is False
 
@@ -200,7 +203,6 @@ async def test_queued_literal_quit_requests_runtime_exit(
             text,
             session,
             console,
-            recorder=None,
             confirm_fn=None,
             is_tty=None,
             request_exit=state.request_exit,
@@ -292,7 +294,6 @@ def test_run_harness_turn_nitro_prompt_uses_cli_agent_actions(
         nitro_prompt,
         session,
         console,
-        recorder=None,
         confirm_fn=None,
         is_tty=None,
         execute_actions=_fake_execute_cli_actions,

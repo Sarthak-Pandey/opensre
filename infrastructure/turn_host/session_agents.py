@@ -15,7 +15,7 @@ from contextlib import contextmanager
 
 from rich.console import Console
 
-from core.agent_harness import SessionCore
+from core.agent_harness import SessionCore, SessionManager
 from core.agent_harness.ports import SlashPortsFactory
 from core.agent_harness.runtime import (
     AgentBuildConfig,
@@ -25,8 +25,10 @@ from core.agent_harness.runtime import (
     HeadlessAgent,
     resolve_agent_ports,
 )
+from core.agent_harness.spi.activity import format_hosted_activity
 from infrastructure.turn_host.bindable_output import BindableOutput
 from infrastructure.turn_host.capability_policy import ensure_gateway_capability_policy
+from infrastructure.turn_host.session_lock import session_execution_lock
 from infrastructure.turn_host.status_messages import status_from_tool_start
 from infrastructure.turn_host.turn_output import TurnOutput
 
@@ -44,9 +46,21 @@ class _ToolStatusObserver:
         tool_name = str(data.get("name") or "").strip()
         if not tool_name:
             return
+        if self._accepts_hosted_activity():
+            activity = format_hosted_activity(tool_name, data.get("input"))
+            if activity is not None:
+                self._output.note_activity(activity.text, kind=activity.kind)
+            return
         self._output.set_tool_status(
             status_from_tool_start(tool_name, data.get("input"), describe=self._describe)
         )
+
+    def _accepts_hosted_activity(self) -> bool:
+        """True when the bound sink is the hosted-prompt collector, not a chat."""
+        target = getattr(self._output, "bound", None)
+        if target is None:
+            target = self._output
+        return getattr(target, "records_hosted_activity", False) is True
 
 
 class SessionAgentPool:
@@ -121,7 +135,14 @@ class SessionAgentPool:
             # No id means no cache entry and nothing shared to protect.
             yield self.agent_for(session=session, output=output, logger=logger)
             return
-        with self._lock_for(session_id):
+        # Take the cross-host lease first, matching TurnRunner.run.  A direct
+        # pool caller that waited on another host must not hold this process's
+        # agent lock while a runner holds the lease and waits for that lock.
+        with session_execution_lock(session_id, reentrant=True), self._lock_for(session_id):
+            # Gateway ingress resolves before taking this cross-host lease. A
+            # CLI resume could have completed while it waited, so reload the
+            # persisted branch before this turn binds or later flushes it.
+            SessionManager.for_session(session).refresh_from_storage(session)
             yield self.agent_for(session=session, output=output, logger=logger)
 
     def agent_for(
