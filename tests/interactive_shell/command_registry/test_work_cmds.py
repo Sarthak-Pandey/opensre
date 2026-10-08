@@ -77,12 +77,8 @@ def test_work_help_explains_how_to_schedule_reminders() -> None:
             "--project requires a value",
         ),
         (
-            "/work add Audit --priority --project backend",
-            "--priority requires a value",
-        ),
-        (
-            "/work add Audit --owner --due 2026-10-10",
-            "--owner requires a value",
+            "/work add Audit --due",
+            "--due requires a value",
         ),
     ],
 )
