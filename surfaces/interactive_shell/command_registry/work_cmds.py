@@ -43,9 +43,25 @@ def _unsupported_reminder_error(args: Sequence[str]) -> str | None:
     return None
 
 
+def _missing_option_value_error(args: Sequence[str]) -> str | None:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in _OPTION_NAMES:
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                return f"[{ERROR}]{arg} requires a value[/]"
+            index += 2
+            continue
+        index += 1
+    return None
+
+
 def _validate_work_args(args: list[str]) -> str | None:
     if args and args[0].lower() == "add":
-        return _unsupported_reminder_error(args[1:])
+        reminder_error = _unsupported_reminder_error(args[1:])
+        if reminder_error is not None:
+            return reminder_error
+        return _missing_option_value_error(args[1:])
     return None
 
 
@@ -56,9 +72,10 @@ def _split_options(args: list[str]) -> tuple[list[str], dict[str, str]]:
     while index < len(args):
         arg = args[index]
         if arg in _OPTION_NAMES:
-            if index + 1 >= len(args):
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
                 options[arg.removeprefix("--")] = ""
-                break
+                index += 1
+                continue
             options[arg.removeprefix("--")] = args[index + 1]
             index += 2
             continue
@@ -114,6 +131,11 @@ def _add(console: Console, args: list[str]) -> bool:
     reminder_error = _unsupported_reminder_error(args)
     if reminder_error is not None:
         console.print(reminder_error)
+        return True
+
+    option_error = _missing_option_value_error(args)
+    if option_error is not None:
+        console.print(option_error)
         return True
 
     words, options = _split_options(args)
